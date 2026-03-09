@@ -1,0 +1,82 @@
+// AKS Runtime Security Lab - Sentinel Analytics Rules
+// Deploy via Deploy-Lab.ps1 or import manually into Sentinel
+
+// ============================================================
+// Rule 1: Binary Drift in Production Namespace
+// Severity: High | Frequency: 5m | Period: 1h
+// MITRE: T1105, T1059
+// ============================================================
+SecurityAlert
+| where AlertType == "K8S.NODE_BinaryDrift" or AlertName has "Binary drift"
+| extend ParsedEntities = parse_json(Entities)
+| mv-expand Entity = ParsedEntities
+| extend Namespace = tostring(Entity.Namespace)
+| extend ClusterName = tostring(Entity.ClusterName)
+| extend ContainerName = tostring(Entity.ContainerName)
+| extend PodName = tostring(Entity.PodName)
+| extend DriftedBinary = tostring(Entity.FilePath)
+| where Namespace in ("default", "production", "kube-system")
+| where isnotempty(ContainerName)
+| project TimeGenerated, AlertSeverity, ClusterName,
+    Namespace, PodName, ContainerName, DriftedBinary
+
+// ============================================================
+// Rule 2: Container Malware Detected
+// Severity: High | Frequency: 5m | Period: 1h
+// MITRE: T1105, T1204
+// ============================================================
+SecurityAlert
+| where AlertType has "K8S.NODE_Malware"
+    or AlertName has_any ("malware", "Malicious file")
+| extend ParsedEntities = parse_json(Entities)
+| mv-expand Entity = ParsedEntities
+| extend ContainerName = tostring(Entity.ContainerName)
+| extend PodName = tostring(Entity.PodName)
+| extend Namespace = tostring(Entity.Namespace)
+| extend ClusterName = tostring(Entity.ClusterName)
+| extend MalwareName = tostring(Entity.MalwareName)
+| extend FilePath = tostring(Entity.FilePath)
+| extend ActionTaken = tostring(Entity.ActionTaken)
+| where isnotempty(ContainerName)
+| project TimeGenerated, AlertSeverity, MalwareName,
+    FilePath, ActionTaken, ClusterName, Namespace,
+    PodName, ContainerName
+
+// ============================================================
+// Rule 3: Vulnerable Image Deployment Attempted
+// Severity: Medium | Frequency: 5m | Period: 1h
+// MITRE: T1610, T1190
+// ============================================================
+SecurityAlert
+| where AlertType has "GatedDeployment"
+    or AlertName has_any ("deployment was blocked", "vulnerable image")
+| extend ParsedEntities = parse_json(Entities)
+| mv-expand Entity = ParsedEntities
+| extend ImageName = tostring(Entity.ImageName)
+| extend ClusterName = tostring(Entity.ClusterName)
+| extend Namespace = tostring(Entity.Namespace)
+| extend VulnCount = tostring(Entity.VulnerabilityCount)
+| where isnotempty(ImageName)
+| project TimeGenerated, AlertSeverity, ImageName,
+    ClusterName, Namespace, VulnCount, Description
+
+// ============================================================
+// Rule 4: Suspicious kubectl exec into Container
+// Severity: Medium | Frequency: 5m | Period: 1h
+// MITRE: T1609
+// ============================================================
+AzureDiagnostics
+| where Category == "kube-audit"
+| extend RequestObject = parse_json(log_s)
+| extend Verb = tostring(RequestObject.verb)
+| extend RequestURI = tostring(RequestObject.requestURI)
+| extend UserAgent = tostring(RequestObject.userAgent)
+| extend SourceIP = tostring(RequestObject.sourceIPs[0])
+| extend Username = tostring(RequestObject.user.username)
+| where Verb == "create"
+| where RequestURI has "/exec"
+| where RequestURI !has "kube-system"
+| extend PodName = extract(@"/pods/([^/]+)/exec", 1, RequestURI)
+| extend Namespace = extract(@"namespaces/([^/]+)/", 1, RequestURI)
+| project TimeGenerated, Username, SourceIP,
+    PodName, Namespace, UserAgent, RequestURI

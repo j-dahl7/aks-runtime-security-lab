@@ -1,0 +1,95 @@
+{
+  "version": "Notebook/1.0",
+  "items": [
+    {
+      "type": 1,
+      "content": {
+        "json": "# Container Runtime Security Dashboard\n\nMonitor binary drift, anti-malware, gated deployment alerts, and kubectl exec activity across AKS clusters."
+      },
+      "name": "header"
+    },
+    {
+      "type": 9,
+      "content": {
+        "version": "KqlParameterItem/1.0",
+        "parameters": [
+          {
+            "id": "time-range",
+            "version": "KqlParameterItem/1.0",
+            "name": "TimeRange",
+            "type": 4,
+            "isRequired": true,
+            "value": {
+              "durationMs": 604800000
+            },
+            "typeSettings": {
+              "selectableValues": [
+                { "durationMs": 3600000, "isInitialTime": false, "grain": 1, "useDashboardTimeRange": false },
+                { "durationMs": 86400000, "isInitialTime": false, "grain": 1, "useDashboardTimeRange": false },
+                { "durationMs": 604800000, "isInitialTime": false, "grain": 1, "useDashboardTimeRange": false },
+                { "durationMs": 2592000000, "isInitialTime": false, "grain": 1, "useDashboardTimeRange": false }
+              ]
+            },
+            "label": "Time Range"
+          }
+        ]
+      },
+      "name": "parameters"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "SecurityAlert\n| where TimeGenerated {TimeRange}\n| where ProductName == \"Microsoft Defender for Cloud\"\n| where AlertType has_any (\"K8S.NODE_BinaryDrift\", \"K8S.NODE_Malware\", \"GatedDeployment\", \"K8S.NODE_SuspectProcess\")\n| summarize Count = count() by bin(TimeGenerated, 1h), AlertType\n| render timechart",
+        "size": 0,
+        "title": "Runtime Alert Timeline",
+        "queryType": 0,
+        "visualization": "timechart"
+      },
+      "name": "alert-timeline"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "SecurityAlert\n| where TimeGenerated {TimeRange}\n| where AlertType == \"K8S.NODE_BinaryDrift\" or AlertName has \"Binary drift\"\n| extend ParsedEntities = parse_json(Entities)\n| mv-expand Entity = ParsedEntities\n| extend Namespace = tostring(Entity.Namespace)\n| where isnotempty(Namespace)\n| summarize DriftCount = count() by Namespace\n| sort by DriftCount desc\n| render barchart",
+        "size": 0,
+        "title": "Binary Drift by Namespace",
+        "queryType": 0,
+        "visualization": "barchart"
+      },
+      "name": "drift-by-namespace"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "SecurityAlert\n| where TimeGenerated {TimeRange}\n| where AlertType == \"K8S.NODE_BinaryDrift\" or AlertName has \"Binary drift\"\n| extend ParsedEntities = parse_json(Entities)\n| mv-expand Entity = ParsedEntities\n| extend DriftedBinary = tostring(Entity.FilePath)\n| extend ContainerName = tostring(Entity.ContainerName)\n| extend Namespace = tostring(Entity.Namespace)\n| extend ClusterName = tostring(Entity.ClusterName)\n| where isnotempty(DriftedBinary)\n| summarize Count = count(), Containers = make_set(ContainerName, 5), LastSeen = max(TimeGenerated) by DriftedBinary, Namespace, ClusterName\n| sort by Count desc\n| take 20",
+        "size": 0,
+        "title": "Top Drifted Binaries",
+        "queryType": 0,
+        "visualization": "table",
+        "gridSettings": {
+          "sortBy": [
+            { "itemKey": "Count", "sortOrder": 2 }
+          ]
+        }
+      },
+      "name": "top-drifted-binaries"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AzureDiagnostics\n| where TimeGenerated {TimeRange}\n| where Category == \"kube-audit\"\n| extend RequestObject = parse_json(log_s)\n| extend Verb = tostring(RequestObject.verb)\n| extend RequestURI = tostring(RequestObject.requestURI)\n| extend Username = tostring(RequestObject.user.username)\n| extend SourceIP = tostring(RequestObject.sourceIPs[0])\n| where Verb == \"create\"\n| where RequestURI has \"/exec\"\n| extend PodName = extract(@\"/pods/([^/]+)/exec\", 1, RequestURI)\n| extend Namespace = extract(@\"namespaces/([^/]+)/\", 1, RequestURI)\n| project TimeGenerated, Username, SourceIP, PodName, Namespace\n| sort by TimeGenerated desc\n| take 50",
+        "size": 0,
+        "title": "kubectl exec Audit Trail",
+        "queryType": 0,
+        "visualization": "table"
+      },
+      "name": "kubectl-exec-trail"
+    }
+  ],
+  "fallbackResourceIds": [],
+  "$schema": "https://github.com/Microsoft/Application-Insights-Workbooks/blob/master/schema/workbook.json"
+}

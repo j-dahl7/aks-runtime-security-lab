@@ -1,0 +1,69 @@
+// AKS Runtime Security Lab - Hunting Queries
+// Import into Sentinel > Hunting > Queries
+
+// ============================================================
+// Hunt 1: Container Processes Not in Original Image (Extended)
+// Broader drift hunt surfacing all unknown processes
+// ============================================================
+SecurityAlert
+| where ProductName == "Microsoft Defender for Cloud"
+| where AlertType has_any ("K8S.NODE_BinaryDrift", "K8S.NODE_SuspectProcess",
+    "K8S.NODE_CryptoMiner", "K8S.NODE_ToolExecution")
+| extend ParsedEntities = parse_json(Entities)
+| mv-expand Entity = ParsedEntities
+| extend ContainerName = tostring(Entity.ContainerName)
+| extend ProcessName = tostring(Entity.ProcessName)
+| extend FilePath = tostring(Entity.FilePath)
+| extend Namespace = tostring(Entity.Namespace)
+| where isnotempty(ContainerName)
+| summarize AlertCount = count(),
+    AlertTypes = make_set(AlertType),
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated)
+    by ContainerName, ProcessName, FilePath, Namespace
+| sort by AlertCount desc
+
+// ============================================================
+// Hunt 2: Cluster Admin Actions from Unexpected Users
+// Surfaces cluster-admin operations from non-standard users
+// ============================================================
+let KnownAdmins = dynamic(["clusterAdmin", "aksService", "masterClient"]);
+AzureDiagnostics
+| where Category == "kube-audit"
+| extend RequestObject = parse_json(log_s)
+| extend Username = tostring(RequestObject.user.username)
+| extend Groups = tostring(RequestObject.user.groups)
+| extend Verb = tostring(RequestObject.verb)
+| extend Resource = tostring(RequestObject.objectRef.resource)
+| extend Namespace = tostring(RequestObject.objectRef.namespace)
+| where Groups has "system:masters" or Username has "admin"
+| where Username !has_any (KnownAdmins)
+| where Verb in ("create", "delete", "patch", "update")
+| project TimeGenerated, Username, Verb, Resource,
+    Namespace, Groups
+| summarize ActionCount = count(),
+    Actions = make_set(strcat(Verb, ":", Resource)),
+    Namespaces = make_set(Namespace)
+    by Username
+| sort by ActionCount desc
+
+// ============================================================
+// Hunt 3: Network Connections from Containers to External IPs
+// Catches C2 callbacks and data exfiltration
+// ============================================================
+SecurityAlert
+| where ProductName == "Microsoft Defender for Cloud"
+| where AlertType has_any ("K8S.NODE_NetworkActivity",
+    "K8S.NODE_SuspiciousConnection", "K8S.NODE_C2Connection")
+| extend ParsedEntities = parse_json(Entities)
+| mv-expand Entity = ParsedEntities
+| extend ContainerName = tostring(Entity.ContainerName)
+| extend DestinationIP = tostring(Entity.DestinationAddress)
+| extend DestinationPort = tostring(Entity.DestinationPort)
+| extend Direction = tostring(Entity.Direction)
+| where isnotempty(DestinationIP)
+| where not(ipv4_is_private(DestinationIP))
+| project TimeGenerated, ContainerName,
+    DestinationIP, DestinationPort, Direction,
+    AlertName, AlertSeverity
+| sort by TimeGenerated desc
