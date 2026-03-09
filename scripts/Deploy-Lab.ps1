@@ -178,7 +178,9 @@ if (-not $SkipSentinel) {
             name     = 'LAB - Binary Drift in Production Namespace'
             severity = 'High'
             query    = @'
-SecurityAlert
+union isfuzzy=true
+    (datatable(TimeGenerated:datetime,AlertType:string,AlertName:string,AlertSeverity:string,Entities:dynamic,Description:string)[]),
+    (SecurityAlert)
 | where AlertType == "K8S.NODE_BinaryDrift" or AlertName has "Binary drift"
 | extend ParsedEntities = parse_json(Entities)
 | mv-expand Entity = ParsedEntities
@@ -199,7 +201,9 @@ SecurityAlert
             name     = 'LAB - Container Malware Detected'
             severity = 'High'
             query    = @'
-SecurityAlert
+union isfuzzy=true
+    (datatable(TimeGenerated:datetime,AlertType:string,AlertName:string,AlertSeverity:string,Entities:dynamic,Description:string)[]),
+    (SecurityAlert)
 | where AlertType has "K8S.NODE_Malware" or AlertName has_any ("malware", "Malicious file")
 | extend ParsedEntities = parse_json(Entities)
 | mv-expand Entity = ParsedEntities
@@ -221,7 +225,9 @@ SecurityAlert
             name     = 'LAB - Vulnerable Image Deployment Attempted'
             severity = 'Medium'
             query    = @'
-SecurityAlert
+union isfuzzy=true
+    (datatable(TimeGenerated:datetime,AlertType:string,AlertName:string,AlertSeverity:string,Entities:dynamic,Description:string)[]),
+    (SecurityAlert)
 | where AlertType has "GatedDeployment" or AlertName has_any ("deployment was blocked", "vulnerable image")
 | extend ParsedEntities = parse_json(Entities)
 | mv-expand Entity = ParsedEntities
