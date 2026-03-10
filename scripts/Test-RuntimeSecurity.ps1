@@ -80,8 +80,9 @@ if (-not $SkipMalware) {
     kubectl wait --for=condition=Ready pod/malware-test --timeout=120s
 
     Write-Host "  Writing EICAR test file into container..."
-    # EICAR test string - this is NOT malware, it's a standard AV test file
-    kubectl exec malware-test -- /bin/sh -c "echo 'X5O!P%@AP[4\PZX54(P^)7CC)7}\$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!\$H+H*' > /tmp/eicar.com"
+    # EICAR test string (base64-encoded to avoid shell escaping issues)
+    # This is NOT malware, it's the standard 68-byte AV test file
+    kubectl exec malware-test -- /bin/sh -c "echo 'WDVPIVAlQEFQWzRcUFpYNTQoUF4pN0NDKTd9JEVJQ0FSLVNUQU5EQVJELUFOVElWSVJVUy1URVNULUZJTEUhJEgrSCo=' | base64 -d > /tmp/eicar.com"
 
     Write-Host "  EICAR test complete." -ForegroundColor Green
     Write-Host "  Expected alert: 'Malicious file detected' (High severity)"
@@ -129,7 +130,7 @@ All test scenarios executed. Monitor for alerts in:
      SecurityAlert
      | where TimeGenerated > ago(1h)
      | where ProductName == "Microsoft Defender for Cloud"
-     | where AlertType has_any ("BinaryDrift", "Malware", "GatedDeployment")
+     | where AlertType has_any ("DriftDetection", "BinaryDrift", "MalwareDetected", "GatedDeployment")
      | project TimeGenerated, AlertName, AlertSeverity, Description
 
 Cleanup test pods:

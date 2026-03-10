@@ -7,14 +7,17 @@
 // MITRE: T1105, T1059
 // ============================================================
 SecurityAlert
-| where AlertType == "K8S.NODE_BinaryDrift" or AlertName has "Binary drift"
+| where AlertType has_any ("DriftDetection", "BinaryDrift")
+    or AlertName has "drift"
 | extend ParsedEntities = parse_json(Entities)
+| extend ExtProps = parse_json(ExtendedProperties)
 | mv-expand Entity = ParsedEntities
-| extend Namespace = tostring(Entity.Namespace)
-| extend ClusterName = tostring(Entity.ClusterName)
-| extend ContainerName = tostring(Entity.ContainerName)
-| extend PodName = tostring(Entity.PodName)
-| extend DriftedBinary = tostring(Entity.FilePath)
+| where tostring(Entity.Type) == "container"
+| extend ContainerName = tostring(Entity.Name)
+| extend PodName = tostring(Entity.Pod.Name)
+| extend Namespace = tostring(Entity.Pod.Namespace.Name)
+| extend ClusterName = CompromisedEntity
+| extend DriftedBinary = tostring(ExtProps["Suspicious Process"])
 | where Namespace in ("default", "production", "kube-system")
 | where isnotempty(ContainerName)
 | project TimeGenerated, AlertSeverity, ClusterName,
@@ -26,17 +29,19 @@ SecurityAlert
 // MITRE: T1105, T1204
 // ============================================================
 SecurityAlert
-| where AlertType has "K8S.NODE_Malware"
+| where AlertType has "MalwareDetected"
     or AlertName has_any ("malware", "Malicious file")
 | extend ParsedEntities = parse_json(Entities)
+| extend ExtProps = parse_json(ExtendedProperties)
 | mv-expand Entity = ParsedEntities
-| extend ContainerName = tostring(Entity.ContainerName)
-| extend PodName = tostring(Entity.PodName)
-| extend Namespace = tostring(Entity.Namespace)
-| extend ClusterName = tostring(Entity.ClusterName)
-| extend MalwareName = tostring(Entity.MalwareName)
-| extend FilePath = tostring(Entity.FilePath)
-| extend ActionTaken = tostring(Entity.ActionTaken)
+| where tostring(Entity.Type) == "container"
+| extend ContainerName = tostring(Entity.Name)
+| extend PodName = tostring(Entity.Pod.Name)
+| extend Namespace = tostring(Entity.Pod.Namespace.Name)
+| extend ClusterName = CompromisedEntity
+| extend MalwareName = tostring(ExtProps["Malware Name"])
+| extend FilePath = tostring(ExtProps["Suspicious Process"])
+| extend ActionTaken = tostring(ExtProps["Action Taken"])
 | where isnotempty(ContainerName)
 | project TimeGenerated, AlertSeverity, MalwareName,
     FilePath, ActionTaken, ClusterName, Namespace,
@@ -50,15 +55,18 @@ SecurityAlert
 SecurityAlert
 | where AlertType has "GatedDeployment"
     or AlertName has_any ("deployment was blocked", "vulnerable image")
-| extend ParsedEntities = parse_json(Entities)
-| mv-expand Entity = ParsedEntities
-| extend ImageName = tostring(Entity.ImageName)
-| extend ClusterName = tostring(Entity.ClusterName)
-| extend Namespace = tostring(Entity.Namespace)
-| extend VulnCount = tostring(Entity.VulnerabilityCount)
+| extend ExtProps = parse_json(ExtendedProperties)
+| extend ImageName = coalesce(
+    tostring(ExtProps["Image Name"]),
+    tostring(ExtProps["ImageName"]),
+    extract(@"[Ii]mage[:\s]+([^\s,]+)", 1, Description))
+| extend ClusterName = CompromisedEntity
+| extend VulnCount = coalesce(
+    tostring(ExtProps["Vulnerability Count"]),
+    extract(@"(\d+)\s+vulnerabilit", 1, Description))
 | where isnotempty(ImageName)
 | project TimeGenerated, AlertSeverity, ImageName,
-    ClusterName, Namespace, VulnCount, Description
+    ClusterName, VulnCount, Description
 
 // ============================================================
 // Rule 4: Suspicious kubectl exec into Container
@@ -73,7 +81,7 @@ AzureDiagnostics
 | extend UserAgent = tostring(RequestObject.userAgent)
 | extend SourceIP = tostring(RequestObject.sourceIPs[0])
 | extend Username = tostring(RequestObject.user.username)
-| where Verb == "create"
+| where Verb in ("create", "get")
 | where RequestURI has "/exec"
 | where RequestURI !has "kube-system"
 | extend PodName = extract(@"/pods/([^/]+)/exec", 1, RequestURI)

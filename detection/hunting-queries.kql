@@ -7,20 +7,21 @@
 // ============================================================
 SecurityAlert
 | where ProductName == "Microsoft Defender for Cloud"
-| where AlertType has_any ("K8S.NODE_BinaryDrift", "K8S.NODE_SuspectProcess",
-    "K8S.NODE_CryptoMiner", "K8S.NODE_ToolExecution")
+| where AlertType has_any ("DriftDetection", "BinaryDrift",
+    "SuspectProcess", "CryptoMiner", "ToolExecution")
 | extend ParsedEntities = parse_json(Entities)
+| extend ExtProps = parse_json(ExtendedProperties)
 | mv-expand Entity = ParsedEntities
-| extend ContainerName = tostring(Entity.ContainerName)
-| extend ProcessName = tostring(Entity.ProcessName)
-| extend FilePath = tostring(Entity.FilePath)
-| extend Namespace = tostring(Entity.Namespace)
+| where tostring(Entity.Type) == "container"
+| extend ContainerName = tostring(Entity.Name)
+| extend Namespace = tostring(Entity.Pod.Namespace.Name)
+| extend ProcessName = tostring(ExtProps["Suspicious Process"])
 | where isnotempty(ContainerName)
 | summarize AlertCount = count(),
     AlertTypes = make_set(AlertType),
     FirstSeen = min(TimeGenerated),
     LastSeen = max(TimeGenerated)
-    by ContainerName, ProcessName, FilePath, Namespace
+    by ContainerName, ProcessName, Namespace
 | sort by AlertCount desc
 
 // ============================================================
@@ -53,17 +54,16 @@ AzureDiagnostics
 // ============================================================
 SecurityAlert
 | where ProductName == "Microsoft Defender for Cloud"
-| where AlertType has_any ("K8S.NODE_NetworkActivity",
-    "K8S.NODE_SuspiciousConnection", "K8S.NODE_C2Connection")
+| where AlertType has_any ("NetworkActivity",
+    "SuspiciousConnection", "C2Connection")
 | extend ParsedEntities = parse_json(Entities)
+| extend ExtProps = parse_json(ExtendedProperties)
 | mv-expand Entity = ParsedEntities
-| extend ContainerName = tostring(Entity.ContainerName)
-| extend DestinationIP = tostring(Entity.DestinationAddress)
-| extend DestinationPort = tostring(Entity.DestinationPort)
-| extend Direction = tostring(Entity.Direction)
+| where tostring(Entity.Type) == "ip"
+| extend DestinationIP = tostring(Entity.Address)
+| extend ContainerName = tostring(ExtProps["Container Name"])
 | where isnotempty(DestinationIP)
 | where not(ipv4_is_private(DestinationIP))
 | project TimeGenerated, ContainerName,
-    DestinationIP, DestinationPort, Direction,
-    AlertName, AlertSeverity
+    DestinationIP, AlertName, AlertSeverity
 | sort by TimeGenerated desc
