@@ -5,11 +5,15 @@
 
 .DESCRIPTION
     Deploys a complete AKS runtime security lab with Defender for Containers:
-    1. AKS cluster with Defender sensor via Bicep
-    2. Defender for Containers plan enablement
-    3. Sentinel analytics rules (4 scheduled rules)
-    4. Sentinel workbook (Container Runtime Security Dashboard)
-    5. Optional: test workloads for validation
+    1. AKS cluster via Bicep (no Defender security profile)
+    2. Defender for Containers plan enablement (with AntiMalware extension)
+    3. Defender sensor via Helm chart (v0.10.2+ with anti-malware collector)
+    4. Sentinel analytics rules (4 scheduled rules)
+    5. Sentinel workbook (Container Runtime Security Dashboard)
+
+    NOTE: Binary drift policy must be configured manually in the Azure portal
+    (Defender for Cloud > Environment Settings > Containers drift policy).
+    The default is "Ignore drift detection" — there is no REST API for this.
 
 .PARAMETER Location
     Azure region for all resources. Default: eastus.
@@ -77,7 +81,7 @@ if ($Destroy) {
 }
 
 # ---------- Pre-flight checks ----------
-Write-Host "[1/6] Pre-flight checks..." -ForegroundColor Yellow
+Write-Host "[1/7] Pre-flight checks..." -ForegroundColor Yellow
 
 $account = az account show --query '{id:id,name:name}' -o json | ConvertFrom-Json
 Write-Host "  Subscription: $($account.name) ($($account.id))"
@@ -90,7 +94,7 @@ foreach ($tool in @('kubectl', 'helm')) {
 }
 
 # ---------- Deploy Infrastructure ----------
-Write-Host "`n[2/6] Deploying infrastructure (Bicep)..." -ForegroundColor Yellow
+Write-Host "`n[2/7] Deploying infrastructure (Bicep)..." -ForegroundColor Yellow
 
 $bicepPath = Join-Path $LabRoot 'bicep/main.bicep'
 
@@ -109,7 +113,7 @@ if ($PSCmdlet.ShouldProcess("Subscription", "Deploy Bicep template")) {
 }
 
 # ---------- Enable Defender for Containers ----------
-Write-Host "`n[3/6] Enabling Defender for Containers plan..." -ForegroundColor Yellow
+Write-Host "`n[3/7] Enabling Defender for Containers plan..." -ForegroundColor Yellow
 
 if ($PSCmdlet.ShouldProcess("Subscription", "Enable Defender for Containers")) {
     az security pricing create `
@@ -117,11 +121,19 @@ if ($PSCmdlet.ShouldProcess("Subscription", "Enable Defender for Containers")) {
         --tier Standard `
         -o none 2>$null
 
-    Write-Host "  Defender for Containers: Enabled" -ForegroundColor Green
+    # Enable AntiMalware on the ContainerSensor extension (defaults to False)
+    $subscriptionId = $account.id
+    az rest --method PUT `
+        --url "https://management.azure.com/subscriptions/$subscriptionId/providers/Microsoft.Security/pricings/Containers?api-version=2024-01-01" `
+        --body '{"properties":{"pricingTier":"Standard","extensions":[{"name":"ContainerSensor","isEnabled":"True","additionalExtensionProperties":{"AntiMalwareEnabled":"True","SecurityGatingEnabled":"True"}},{"name":"ContainerRegistriesVulnerabilityAssessments","isEnabled":"True"},{"name":"AgentlessDiscoveryForKubernetes","isEnabled":"True"},{"name":"ContainerIntegrityContribution","isEnabled":"True"}]}}' `
+        --headers 'Content-Type=application/json' `
+        -o none 2>$null
+
+    Write-Host "  Defender for Containers: Enabled (with AntiMalware)" -ForegroundColor Green
 }
 
 # ---------- Get AKS Credentials ----------
-Write-Host "`n[4/6] Getting AKS credentials..." -ForegroundColor Yellow
+Write-Host "`n[4/7] Getting AKS credentials..." -ForegroundColor Yellow
 
 if ($PSCmdlet.ShouldProcess($clusterName, "Get AKS credentials")) {
     az aks get-credentials `
@@ -130,28 +142,49 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Get AKS credentials")) {
         --overwrite-existing
 
     Write-Host "  kubectl context set to: $clusterName" -ForegroundColor Green
+}
 
-    # Verify Defender sensor is running
+# ---------- Deploy Defender Sensor via Helm ----------
+Write-Host "`n[5/7] Deploying Defender sensor via Helm (with anti-malware)..." -ForegroundColor Yellow
+
+if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
+    $clusterId = az aks show --resource-group $ResourceGroup --name $clusterName --query id -o tsv
+
+    # Download the official Microsoft install script
+    $installScriptUrl = 'https://raw.githubusercontent.com/microsoft/Microsoft-Defender-For-Containers/main/scripts/install_defender_sensor_aks.sh'
+    $installScriptPath = Join-Path $env:TEMP 'install_defender_sensor_aks.sh'
+    Invoke-WebRequest -Uri $installScriptUrl -OutFile $installScriptPath -UseBasicParsing
+
+    # Run the install script with anti-malware enabled
+    bash $installScriptPath --id $clusterId --version latest --antimalware
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "  Defender sensor: Deployed via Helm (with anti-malware)" -ForegroundColor Green
+    } else {
+        Write-Host "  [!] Helm deployment failed. Check errors above." -ForegroundColor Yellow
+        Write-Host "      Manual install: bash install_defender_sensor_aks.sh --id '$clusterId' --version latest --antimalware" -ForegroundColor Gray
+    }
+
+    # Wait for sensor pods to come up
     Write-Host "  Waiting for Defender sensor pods..." -ForegroundColor Gray
     $retries = 0
     $maxRetries = 12
     while ($retries -lt $maxRetries) {
-        $defenderPods = kubectl get pods -n kube-system -l app=microsoft-defender -o name 2>$null
+        $defenderPods = kubectl get pods -n mdc -o name 2>$null | Select-String 'microsoft-defender'
         if ($defenderPods) {
-            Write-Host "  Defender sensor: Running" -ForegroundColor Green
+            Write-Host "  Defender sensor pods: Running" -ForegroundColor Green
             break
         }
         $retries++
         Start-Sleep -Seconds 10
     }
     if ($retries -eq $maxRetries) {
-        Write-Host "  [!] Defender sensor not yet detected. It may take a few minutes to initialize." -ForegroundColor Yellow
+        Write-Host "  [!] Defender sensor pods not yet detected. They may take a few minutes to initialize." -ForegroundColor Yellow
     }
 }
 
 # ---------- Deploy Sentinel Rules ----------
 if (-not $SkipSentinel) {
-    Write-Host "`n[5/6] Deploying Sentinel analytics rules..." -ForegroundColor Yellow
+    Write-Host "`n[6/7] Deploying Sentinel analytics rules..." -ForegroundColor Yellow
 
     $subscriptionId = $account.id
     $apiVersion = '2024-03-01'
@@ -178,68 +211,64 @@ if (-not $SkipSentinel) {
             name     = 'LAB - Binary Drift in Production Namespace'
             severity = 'High'
             query    = @'
-union isfuzzy=true
-    (datatable(TimeGenerated:datetime,AlertType:string,AlertName:string,AlertSeverity:string,Entities:dynamic,Description:string)[]),
-    (SecurityAlert)
-| where AlertType == "K8S.NODE_BinaryDrift" or AlertName has "Binary drift"
+SecurityAlert
+| where AlertType has_any ("DriftDetection", "BinaryDrift") or AlertName has "drift"
 | extend ParsedEntities = parse_json(Entities)
+| extend ExtProps = parse_json(ExtendedProperties)
 | mv-expand Entity = ParsedEntities
-| extend Namespace = tostring(Entity.Namespace)
-| extend ClusterName = tostring(Entity.ClusterName)
-| extend ContainerName = tostring(Entity.ContainerName)
-| extend PodName = tostring(Entity.PodName)
-| extend DriftedBinary = tostring(Entity.FilePath)
+| where tostring(Entity.Type) == "container"
+| extend ContainerName = tostring(Entity.Name)
+| extend PodName = tostring(Entity.Pod.Name)
+| extend Namespace = tostring(Entity.Pod.Namespace.Name)
+| extend ClusterName = CompromisedEntity
+| extend DriftedBinary = tostring(ExtProps["Suspicious Process"])
 | where Namespace in ("default", "production", "kube-system")
 | where isnotempty(ContainerName)
 | project TimeGenerated, AlertSeverity, ClusterName, Namespace, PodName, ContainerName, DriftedBinary
 '@
-            tactics  = @('Execution')
-            techniques = @('T1059')
+            tactics  = @('Execution', 'CommandAndControl')
+            techniques = @('T1059', 'T1105')
         },
         @{
             id       = 'aks-container-malware'
             name     = 'LAB - Container Malware Detected'
             severity = 'High'
             query    = @'
-union isfuzzy=true
-    (datatable(TimeGenerated:datetime,AlertType:string,AlertName:string,AlertSeverity:string,Entities:dynamic,Description:string)[]),
-    (SecurityAlert)
-| where AlertType has "K8S.NODE_Malware" or AlertName has_any ("malware", "Malicious file")
+SecurityAlert
+| where AlertType has "MalwareDetected" or AlertName has_any ("malware", "Malicious file")
 | extend ParsedEntities = parse_json(Entities)
+| extend ExtProps = parse_json(ExtendedProperties)
 | mv-expand Entity = ParsedEntities
-| extend ContainerName = tostring(Entity.ContainerName)
-| extend PodName = tostring(Entity.PodName)
-| extend Namespace = tostring(Entity.Namespace)
-| extend ClusterName = tostring(Entity.ClusterName)
-| extend MalwareName = tostring(Entity.MalwareName)
-| extend FilePath = tostring(Entity.FilePath)
-| extend ActionTaken = tostring(Entity.ActionTaken)
+| where tostring(Entity.Type) == "container"
+| extend ContainerName = tostring(Entity.Name)
+| extend PodName = tostring(Entity.Pod.Name)
+| extend Namespace = tostring(Entity.Pod.Namespace.Name)
+| extend ClusterName = CompromisedEntity
+| extend MalwareName = tostring(ExtProps["Malware Name"])
+| extend FilePath = tostring(ExtProps["Suspicious Process"])
+| extend ActionTaken = tostring(ExtProps["Action Taken"])
 | where isnotempty(ContainerName)
 | project TimeGenerated, AlertSeverity, MalwareName, FilePath, ActionTaken, ClusterName, Namespace, PodName, ContainerName
 '@
-            tactics  = @('Execution')
-            techniques = @('T1204')
+            tactics  = @('Execution', 'CommandAndControl')
+            techniques = @('T1204', 'T1105')
         },
         @{
             id       = 'aks-gated-deployment-block'
             name     = 'LAB - Vulnerable Image Deployment Attempted'
             severity = 'Medium'
             query    = @'
-union isfuzzy=true
-    (datatable(TimeGenerated:datetime,AlertType:string,AlertName:string,AlertSeverity:string,Entities:dynamic,Description:string)[]),
-    (SecurityAlert)
+SecurityAlert
 | where AlertType has "GatedDeployment" or AlertName has_any ("deployment was blocked", "vulnerable image")
-| extend ParsedEntities = parse_json(Entities)
-| mv-expand Entity = ParsedEntities
-| extend ImageName = tostring(Entity.ImageName)
-| extend ClusterName = tostring(Entity.ClusterName)
-| extend Namespace = tostring(Entity.Namespace)
-| extend VulnCount = tostring(Entity.VulnerabilityCount)
+| extend ExtProps = parse_json(ExtendedProperties)
+| extend ImageName = coalesce(tostring(ExtProps["Image Name"]), tostring(ExtProps["ImageName"]), extract(@"[Ii]mage[:\s]+([^\s,]+)", 1, Description))
+| extend ClusterName = CompromisedEntity
+| extend VulnCount = coalesce(tostring(ExtProps["Vulnerability Count"]), extract(@"(\d+)\s+vulnerabilit", 1, Description))
 | where isnotempty(ImageName)
-| project TimeGenerated, AlertSeverity, ImageName, ClusterName, Namespace, VulnCount, Description
+| project TimeGenerated, AlertSeverity, ImageName, ClusterName, VulnCount, Description
 '@
-            tactics  = @('InitialAccess')
-            techniques = @('T1190')
+            tactics  = @('InitialAccess', 'Execution')
+            techniques = @('T1190', 'T1610')
         },
         @{
             id       = 'aks-kubectl-exec'
@@ -254,7 +283,7 @@ AzureDiagnostics
 | extend UserAgent = tostring(RequestObject.userAgent)
 | extend SourceIP = tostring(RequestObject.sourceIPs[0])
 | extend Username = tostring(RequestObject.user.username)
-| where Verb == "create"
+| where Verb in ("create", "get")
 | where RequestURI has "/exec"
 | where RequestURI !has "kube-system"
 | extend PodName = extract(@"/pods/([^/]+)/exec", 1, RequestURI)
@@ -301,7 +330,7 @@ AzureDiagnostics
     }
 
     # Deploy workbook
-    Write-Host "`n[6/6] Deploying Sentinel workbook..." -ForegroundColor Yellow
+    Write-Host "`n[7/7] Deploying Sentinel workbook..." -ForegroundColor Yellow
 
     $workbookPath = Join-Path $LabRoot 'workbook/container-runtime-workbook.json'
     if (Test-Path $workbookPath) {
@@ -331,8 +360,8 @@ AzureDiagnostics
         Write-Host "  [!] Workbook template not found at $workbookPath, skipping." -ForegroundColor Yellow
     }
 } else {
-    Write-Host "`n[5/6] Skipping Sentinel rules (--SkipSentinel)." -ForegroundColor Gray
-    Write-Host "[6/6] Skipping workbook (--SkipSentinel)." -ForegroundColor Gray
+    Write-Host "`n[6/7] Skipping Sentinel rules (--SkipSentinel)." -ForegroundColor Gray
+    Write-Host "[7/7] Skipping workbook (--SkipSentinel)." -ForegroundColor Gray
 }
 
 # ---------- Summary ----------
@@ -341,21 +370,30 @@ Write-Host @"
 
 Resources deployed:
   - AKS Cluster:    $clusterName (1 node, Standard_D4s_v3)
-  - Defender:       Defender for Containers enabled
+  - Defender:       Defender for Containers enabled (with AntiMalware extension)
+  - Sensor:         Helm chart v0.10.2+ (anti-malware collector enabled)
   - Workspace:      $WorkspaceName (Container Insights + Sentinel)
   - Sentinel:       4 analytics rules + 1 workbook
 
-Next steps:
-  1. Verify Defender sensor:
-     kubectl get pods -n kube-system -l app=microsoft-defender
+IMPORTANT - Manual step required:
+  Configure binary drift policy in the Azure portal:
+  Defender for Cloud > Environment Settings > Containers drift policy
+  Change default from "Ignore drift detection" to "Drift detection alert"
+  (No REST API exists for this setting)
 
-  2. Run the test scenarios:
+Next steps:
+  1. Configure drift policy (see above)
+
+  2. Verify Defender sensor:
+     kubectl get pods -n mdc
+
+  3. Run the test scenarios:
      ./scripts/Test-RuntimeSecurity.ps1
 
-  3. View alerts in Defender for Cloud:
+  4. View alerts in Defender for Cloud:
      https://portal.azure.com/#view/Microsoft_Azure_Security/SecurityMenuBlade/~/SecurityAlerts
 
-  4. View Sentinel incidents:
+  5. View Sentinel incidents:
      https://security.microsoft.com/sentinel-incidents
 
 Cleanup:

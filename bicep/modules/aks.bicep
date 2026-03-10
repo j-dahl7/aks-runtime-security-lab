@@ -1,4 +1,6 @@
-// AKS Cluster with Defender for Containers security profile
+// AKS Cluster for Defender for Containers lab
+// Note: Defender sensor is deployed separately via Helm (Deploy-Lab.ps1 step 5)
+// to get v0.10.2+ with anti-malware support.
 
 param projectName string
 param location string
@@ -62,14 +64,10 @@ resource aks 'Microsoft.ContainerService/managedClusters@2024-09-01' = {
       enabled: true
     }
 
-    // Security profile - Defender sensor DaemonSet + workload identity
+    // Security profile - workload identity only
+    // Defender sensor is deployed via Helm chart (Deploy-Lab.ps1) for v0.10.2+
+    // which includes anti-malware collector and drift blocking support.
     securityProfile: {
-      defender: {
-        securityMonitoring: {
-          enabled: true
-        }
-        logAnalyticsWorkspaceResourceId: logAnalyticsWorkspaceId
-      }
       workloadIdentity: {
         enabled: true
       }
