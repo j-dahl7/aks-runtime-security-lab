@@ -26,18 +26,21 @@ cd aks-runtime-security-lab
 ```
 
 ```powershell
-# Deploy everything (AKS + Defender + Sentinel rules + workbook)
+# Deploy everything (AKS + Defender + Helm sensor + Sentinel rules + workbook)
 ./scripts/Deploy-Lab.ps1 -Location "eastus"
 
 # Run test scenarios (binary drift, EICAR malware, vulnerable image)
 ./scripts/Test-RuntimeSecurity.ps1
 ```
 
+> **Portal step required:** After deployment, configure the **binary drift policy** in Defender for Cloud > Environment Settings > Containers drift policy. The default is "Ignore drift detection" — change it to "Drift detection alert" (or "Block" in Preview). There is no REST API for this setting.
+
 ## What Gets Deployed
 
 | Resource | Type | Purpose |
 |---|---|---|
-| `aks-runtime-lab` | AKS Cluster | Single-node cluster (Standard_D4s_v3) with Defender sensor |
+| `aks-runtime-lab` | AKS Cluster | Single-node cluster (Standard_D4s_v3) |
+| Defender Sensor | Helm Chart | v0.10.2+ with anti-malware collector (mdc namespace) |
 | `aks-runtime-lab-law` | Log Analytics | Container Insights + Microsoft Sentinel |
 | Defender for Containers | Security Plan | Subscription-level enablement |
 | 4 Analytics Rules | Sentinel | Binary drift, malware, gated deployment, kubectl exec |
@@ -49,7 +52,7 @@ cd aks-runtime-security-lab
 ├── bicep/
 │   ├── main.bicep                  # Subscription-scoped orchestrator
 │   └── modules/
-│       ├── aks.bicep               # AKS + Defender sensor + diagnostics
+│       ├── aks.bicep               # AKS cluster + diagnostics (sensor via Helm)
 │       └── monitoring.bicep        # Log Analytics + Sentinel + Container Insights
 ├── detection/
 │   ├── analytics-rules.kql         # 4 Sentinel analytics rules
@@ -82,7 +85,7 @@ Writes the [EICAR test file](https://www.eicar.org/download-anti-malware-testfil
 ```bash
 kubectl run malware-test --image=nginx:latest --restart=Never
 kubectl exec malware-test -- /bin/sh -c \
-  "echo 'X5O!P%@AP[4\PZX54(P^)7CC)7}\$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!\$H+H*' > /tmp/eicar.com"
+  "echo 'WDVPIVAlQEFQWzRcUFpYNTQoUF4pN0NDKTd9JEVJQ0FSLVNUQU5EQVJELUFOVElWSVJVUy1URVNULUZJTEUhJEgrSCo=' | base64 -d > /tmp/eicar.com"
 ```
 
 **Expected alert:** "Malicious file detected" (5-15 min)
