@@ -150,18 +150,50 @@ Write-Host "`n[5/7] Deploying Defender sensor via Helm (with anti-malware)..." -
 if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
     $clusterId = az aks show --resource-group $ResourceGroup --name $clusterName --query id -o tsv
 
-    # Download the official Microsoft install script
-    $installScriptUrl = 'https://raw.githubusercontent.com/microsoft/Microsoft-Defender-For-Containers/main/scripts/install_defender_sensor_aks.sh'
-    $installScriptPath = Join-Path ([System.IO.Path]::GetTempPath()) 'install_defender_sensor_aks.sh'
-    Invoke-WebRequest -Uri $installScriptUrl -OutFile $installScriptPath -UseBasicParsing
+    $hasBash = [bool](Get-Command bash -ErrorAction SilentlyContinue)
+    if ($hasBash) {
+        # Use the official Microsoft install script (Linux, macOS, WSL, Cloud Shell)
+        $installScriptUrl = 'https://raw.githubusercontent.com/microsoft/Microsoft-Defender-For-Containers/main/scripts/install_defender_sensor_aks.sh'
+        $installScriptPath = Join-Path ([System.IO.Path]::GetTempPath()) 'install_defender_sensor_aks.sh'
+        Invoke-WebRequest -Uri $installScriptUrl -OutFile $installScriptPath -UseBasicParsing
 
-    # Run the install script with anti-malware enabled
-    bash $installScriptPath --id $clusterId --version latest --antimalware
+        bash $installScriptPath --id $clusterId --version latest --antimalware
+    } else {
+        # Native Windows (no bash): install Defender sensor via Helm directly
+        Write-Host "  bash not found — using direct Helm install (Windows native)..." -ForegroundColor Gray
+
+        # Disable existing Defender security profile (if any)
+        az aks update --resource-group $ResourceGroup --name $clusterName --disable-defender -o none 2>$null
+
+        # Get workspace details for the Helm chart
+        $wsCustomerId = az monitor log-analytics workspace show `
+            --resource-group $ResourceGroup --workspace-name $WorkspaceName `
+            --query customerId -o tsv
+        $wsSharedKey = az monitor log-analytics workspace get-shared-keys `
+            --resource-group $ResourceGroup --workspace-name $WorkspaceName `
+            --query primarySharedKey -o tsv
+        $clusterRegion = az aks show --resource-group $ResourceGroup --name $clusterName `
+            --query location -o tsv
+
+        helm upgrade --install microsoft-defender `
+            oci://mcr.microsoft.com/azuredefender/microsoft-defender-for-containers `
+            --version 0.10.2 `
+            --namespace mdc --create-namespace `
+            --set global.clusterName=$clusterName `
+            --set global.subscriptionId=$subscriptionId `
+            --set global.resourceGroupName=$ResourceGroup `
+            --set global.clusterRegion=$clusterRegion `
+            --set global.azsecpackAutoConfigEnabled=true `
+            --set logAnalytics.workspaceId=$wsCustomerId `
+            --set logAnalytics.workspaceKey=$wsSharedKey `
+            --set collectors.antimalwareCollector.enable=true
+    }
+
     if ($LASTEXITCODE -eq 0) {
         Write-Host "  Defender sensor: Deployed via Helm (with anti-malware)" -ForegroundColor Green
     } else {
         Write-Host "  [!] Helm deployment failed. Check errors above." -ForegroundColor Yellow
-        Write-Host "      Manual install: bash install_defender_sensor_aks.sh --id '$clusterId' --version latest --antimalware" -ForegroundColor Gray
+        Write-Host "      See: https://learn.microsoft.com/en-us/azure/defender-for-cloud/deploy-helm" -ForegroundColor Gray
     }
 
     # Wait for sensor pods to come up
