@@ -152,7 +152,7 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
 
     # Download the official Microsoft install script
     $installScriptUrl = 'https://raw.githubusercontent.com/microsoft/Microsoft-Defender-For-Containers/main/scripts/install_defender_sensor_aks.sh'
-    $installScriptPath = Join-Path $env:TEMP 'install_defender_sensor_aks.sh'
+    $installScriptPath = Join-Path ([System.IO.Path]::GetTempPath()) 'install_defender_sensor_aks.sh'
     Invoke-WebRequest -Uri $installScriptUrl -OutFile $installScriptPath -UseBasicParsing
 
     # Run the install script with anti-malware enabled
@@ -211,7 +211,7 @@ if (-not $SkipSentinel) {
             name     = 'LAB - Binary Drift in Production Namespace'
             severity = 'High'
             query    = @'
-SecurityAlert
+union isfuzzy=true (datatable(TimeGenerated:datetime,AlertType:string,AlertName:string,Entities:string,ExtendedProperties:string,CompromisedEntity:string,AlertSeverity:string)[]), (SecurityAlert)
 | where AlertType has_any ("DriftDetection", "BinaryDrift") or AlertName has "drift"
 | extend ParsedEntities = parse_json(Entities)
 | extend ExtProps = parse_json(ExtendedProperties)
@@ -234,7 +234,7 @@ SecurityAlert
             name     = 'LAB - Container Malware Detected'
             severity = 'High'
             query    = @'
-SecurityAlert
+union isfuzzy=true (datatable(TimeGenerated:datetime,AlertType:string,AlertName:string,Entities:string,ExtendedProperties:string,CompromisedEntity:string,AlertSeverity:string)[]), (SecurityAlert)
 | where AlertType has "MalwareDetected" or AlertName has_any ("malware", "Malicious file")
 | extend ParsedEntities = parse_json(Entities)
 | extend ExtProps = parse_json(ExtendedProperties)
@@ -258,7 +258,7 @@ SecurityAlert
             name     = 'LAB - Vulnerable Image Deployment Attempted'
             severity = 'Medium'
             query    = @'
-SecurityAlert
+union isfuzzy=true (datatable(TimeGenerated:datetime,AlertType:string,AlertName:string,ExtendedProperties:string,CompromisedEntity:string,AlertSeverity:string,Description:string)[]), (SecurityAlert)
 | where AlertType has "GatedDeployment" or AlertName has_any ("deployment was blocked", "vulnerable image")
 | extend ExtProps = parse_json(ExtendedProperties)
 | extend ImageName = coalesce(tostring(ExtProps["Image Name"]), tostring(ExtProps["ImageName"]), extract(@"[Ii]mage[:\s]+([^\s,]+)", 1, Description))
