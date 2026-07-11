@@ -26,7 +26,7 @@ param nodeVmSize string = 'Standard_D4s_v3'
 param nodeCount int = 1
 
 @description('Kubernetes version')
-param kubernetesVersion string = '1.32'
+param kubernetesVersion string = '1.35'
 
 @description('Additional tags for all resources')
 param tags object = {}

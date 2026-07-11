@@ -7,7 +7,7 @@
     Deploys a complete AKS runtime security lab with Defender for Containers:
     1. AKS cluster via Bicep (no Defender security profile)
     2. Defender for Containers plan enablement (with AntiMalware extension)
-    3. Defender sensor via Helm chart (v0.10.2+ with anti-malware collector)
+    3. Defender sensor via Helm chart (pinned 0.11.4 with anti-malware collector)
     4. Sentinel analytics rules (4 scheduled rules)
     5. Sentinel workbook (Container Runtime Security Dashboard)
 
@@ -63,6 +63,235 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LabRoot = Split-Path -Parent $ScriptDir
 $ResourceGroup = "$ProjectName-rg"
 $WorkspaceName = "$ProjectName-law"
+$DefenderPolicyDefinitionId = '64def556-fbad-4622-930e-72d1d5589bf5'
+$DefenderHelmReleaseName = 'defender-k8s'
+$DefenderHelmChart = 'oci://mcr.microsoft.com/azuredefender/microsoft-defender-for-containers'
+$DefenderHelmChartVersion = '0.11.4'
+$DefenderExclusionTag = 'ms_defender_e2e_discovery_exclude'
+
+function Assert-LastExitCode {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Action
+    )
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Action failed with exit code $LASTEXITCODE."
+    }
+}
+
+function New-OwnerOnlyTempDirectory {
+    $path = Join-Path ([System.IO.Path]::GetTempPath()) ("nine-lives-defender-{0}" -f [guid]::NewGuid().ToString('N'))
+    $directory = [System.IO.Directory]::CreateDirectory($path)
+
+    try {
+        if ($IsWindows) {
+            $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+            $acl = [System.Security.AccessControl.DirectorySecurity]::new()
+            $acl.SetOwner($identity.User)
+            $acl.SetAccessRuleProtection($true, $false)
+            $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+                $identity.User,
+                [System.Security.AccessControl.FileSystemRights]::FullControl,
+                [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit',
+                [System.Security.AccessControl.PropagationFlags]::None,
+                [System.Security.AccessControl.AccessControlType]::Allow
+            )
+            $null = $acl.AddAccessRule($rule)
+            [System.IO.FileSystemAclExtensions]::SetAccessControl($directory, $acl)
+        }
+        else {
+            [System.IO.File]::SetUnixFileMode(
+                $path,
+                [System.IO.UnixFileMode]::UserRead -bor
+                [System.IO.UnixFileMode]::UserWrite -bor
+                [System.IO.UnixFileMode]::UserExecute
+            )
+        }
+
+        return $path
+    }
+    catch {
+        Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
+        throw
+    }
+}
+
+function New-SecureHelmValuesFile {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Content
+    )
+
+    $directory = New-OwnerOnlyTempDirectory
+    $path = Join-Path $directory 'values.json'
+
+    try {
+        [System.IO.File]::WriteAllText($path, $Content, [System.Text.UTF8Encoding]::new($false))
+
+        if ($IsWindows) {
+            $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+            $acl = [System.Security.AccessControl.FileSecurity]::new()
+            $acl.SetOwner($identity.User)
+            $acl.SetAccessRuleProtection($true, $false)
+            $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+                $identity.User,
+                [System.Security.AccessControl.FileSystemRights]::FullControl,
+                [System.Security.AccessControl.AccessControlType]::Allow
+            )
+            $null = $acl.AddAccessRule($rule)
+            [System.IO.FileSystemAclExtensions]::SetAccessControl([System.IO.FileInfo]::new($path), $acl)
+        }
+        else {
+            [System.IO.File]::SetUnixFileMode(
+                $path,
+                [System.IO.UnixFileMode]::UserRead -bor [System.IO.UnixFileMode]::UserWrite
+            )
+        }
+
+        return [pscustomobject]@{
+            Directory = $directory
+            Path      = $path
+        }
+    }
+    catch {
+        Remove-Item -LiteralPath $directory -Recurse -Force -ErrorAction SilentlyContinue
+        throw
+    }
+}
+
+function Remove-SecureHelmValuesFile {
+    param(
+        [Parameter(Mandatory)]
+        [object]$TemporaryValues
+    )
+
+    if (Test-Path -LiteralPath $TemporaryValues.Path) {
+        Remove-Item -LiteralPath $TemporaryValues.Path -Force -ErrorAction Stop
+    }
+    if (Test-Path -LiteralPath $TemporaryValues.Directory) {
+        Remove-Item -LiteralPath $TemporaryValues.Directory -Recurse -Force -ErrorAction Stop
+    }
+}
+
+function Get-ConflictingDefenderPolicyAssignments {
+    param(
+        [Parameter(Mandatory)]
+        [string]$SubscriptionId,
+
+        [Parameter(Mandatory)]
+        [string]$ResourceGroupName
+    )
+
+    $assignments = @()
+    $scopeArgumentSets = @(
+        @('--scope', "/subscriptions/$SubscriptionId"),
+        @('--resource-group', $ResourceGroupName)
+    )
+
+    foreach ($scopeArguments in $scopeArgumentSets) {
+        $json = az policy assignment list @scopeArguments --output json
+        Assert-LastExitCode -Action 'Defender auto-provision policy lookup'
+        if (-not [string]::IsNullOrWhiteSpace(($json -join "`n"))) {
+            $assignments += @(($json -join "`n") | ConvertFrom-Json)
+        }
+    }
+
+    return @(
+        $assignments |
+            Where-Object { $_.policyDefinitionId -like "*$DefenderPolicyDefinitionId*" } |
+            Sort-Object -Property id -Unique
+    )
+}
+
+function Get-StaleDefenderClusterResources {
+    $resourceSelectors = @(
+        @{ Kind = 'crd'; Name = 'policies.defender.microsoft.com' },
+        @{ Kind = 'crd'; Name = 'runtimepolicies.defender.microsoft.com' },
+        @{ Kind = 'crd'; Name = 'securityartifactpolicies.defender.microsoft.com' },
+        @{ Kind = 'clusterrole'; Name = 'defender-admission-controller-cluster-role' },
+        @{ Kind = 'clusterrole'; Name = 'defender-admission-controller-resource-cluster-role' },
+        @{ Kind = 'clusterrolebinding'; Name = 'defender-admission-controller-cluster-role-binding' },
+        @{ Kind = 'clusterrolebinding'; Name = 'defender-admission-controller-cluster-resource-role-binding' }
+    )
+
+    $existing = @()
+    foreach ($selector in $resourceSelectors) {
+        $result = kubectl get $selector.Kind $selector.Name --ignore-not-found --output name 2>$null
+        Assert-LastExitCode -Action "Kubernetes preflight for $($selector.Kind)/$($selector.Name)"
+        if (-not [string]::IsNullOrWhiteSpace(($result -join "`n"))) {
+            $existing += $selector
+        }
+    }
+    return $existing
+}
+
+function Restore-ClusterProtectionState {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ResourceGroupName,
+
+        [Parameter(Mandatory)]
+        [string]$ClusterName,
+
+        [Parameter(Mandatory)]
+        [string]$ClusterId,
+
+        [Parameter(Mandatory)]
+        [bool]$DefenderWasEnabled,
+
+        [Parameter()]
+        [string]$DefenderWorkspaceId,
+
+        [Parameter(Mandatory)]
+        [bool]$ExclusionTagExisted,
+
+        [Parameter()]
+        [string]$ExclusionTagValue
+    )
+
+    $rollbackErrors = @()
+
+    if ($DefenderWasEnabled) {
+        $enableArguments = @(
+            'aks', 'update',
+            '--resource-group', $ResourceGroupName,
+            '--name', $ClusterName,
+            '--enable-defender',
+            '--output', 'none'
+        )
+        if ($DefenderWorkspaceId) {
+            $enableArguments += @('--defender-config', "logAnalyticsWorkspaceResourceId=$DefenderWorkspaceId")
+        }
+
+        az @enableArguments 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            $rollbackErrors += 'failed to re-enable the prior AKS Defender profile'
+        }
+    }
+
+    if ($ExclusionTagExisted) {
+        az tag update `
+            --resource-id $ClusterId `
+            --operation merge `
+            --tags "${DefenderExclusionTag}=$ExclusionTagValue" `
+            --output none
+    }
+    else {
+        az tag update `
+            --resource-id $ClusterId `
+            --operation delete `
+            --tags $DefenderExclusionTag `
+            --output none
+    }
+    if ($LASTEXITCODE -ne 0) {
+        $rollbackErrors += 'failed to restore the prior Defender auto-provision exclusion tag state'
+    }
+
+    if ($rollbackErrors.Count -gt 0) {
+        throw ('Cluster protection rollback was incomplete: {0}.' -f ($rollbackErrors -join '; '))
+    }
+}
 
 Write-Host "`n=== AKS Runtime Security Lab ===" -ForegroundColor Cyan
 Write-Host "Project:        $ProjectName"
@@ -70,27 +299,58 @@ Write-Host "Resource Group: $ResourceGroup"
 Write-Host "Location:       $Location"
 Write-Host ""
 
+# ---------- Pre-flight checks ----------
+Write-Host "[1/7] Pre-flight checks..." -ForegroundColor Yellow
+
+$requiredTools = if ($Destroy -or $WhatIfPreference) { @('az') } else { @('az', 'kubectl', 'helm') }
+$toolInstallLinks = @{
+    az      = 'https://learn.microsoft.com/cli/azure/install-azure-cli'
+    kubectl = 'https://kubernetes.io/docs/tasks/tools/'
+    helm    = 'https://helm.sh/docs/intro/install/'
+}
+foreach ($tool in $requiredTools) {
+    if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+        throw "$tool is required but not installed. See $($toolInstallLinks[$tool])"
+    }
+}
+
+$account = az account show --query '{id:id,name:name}' --output json | ConvertFrom-Json
+Assert-LastExitCode -Action 'Azure account lookup'
+if (-not $account.id) {
+    throw "Azure CLI is not signed in. Run 'az login' and select the intended subscription."
+}
+Write-Host "  Subscription: $($account.name) ($($account.id))"
+
 # ---------- Destroy ----------
 if ($Destroy) {
     Write-Host "[!] Destroying lab..." -ForegroundColor Yellow
-    if ($PSCmdlet.ShouldProcess($ResourceGroup, "Delete resource group")) {
+    if ($PSCmdlet.ShouldProcess($ResourceGroup, 'Delete resource group')) {
         az group delete --name $ResourceGroup --yes --no-wait
+        Assert-LastExitCode -Action "Resource-group deletion for $ResourceGroup"
         Write-Host "[+] Resource group deletion initiated: $ResourceGroup" -ForegroundColor Green
     }
     return
 }
 
-# ---------- Pre-flight checks ----------
-Write-Host "[1/7] Pre-flight checks..." -ForegroundColor Yellow
+if ($WhatIfPreference) {
+    $sentinelPreview = if ($SkipSentinel) { 'Skip Sentinel rules and workbook' } else { 'Create or update 4 Sentinel rules and 1 workbook' }
+    Write-Host "`n=== Deployment Preview Only ===" -ForegroundColor Yellow
+    Write-Host @"
 
-$account = az account show --query '{id:id,name:name}' -o json | ConvertFrom-Json
-Write-Host "  Subscription: $($account.name) ($($account.id))"
+No Azure, Kubernetes, Helm, kubeconfig, or local secret-file mutations were performed.
 
-# Check required CLI tools
-foreach ($tool in @('kubectl', 'helm')) {
-    if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
-        Write-Error "$tool is required but not installed. See https://kubernetes.io/docs/tasks/tools/"
-    }
+Planned changes:
+  - Deploy AKS cluster: $ProjectName (Kubernetes 1.35, 1 node, Standard_D4s_v3)
+  - Deploy workspace:   $WorkspaceName
+  - Enable the subscription-level Defender for Containers plan
+  - Replace the managed AKS Defender profile with Helm chart $DefenderHelmChartVersion
+  - Enable the Helm anti-malware collector
+  - $sentinelPreview
+
+Manual step after a real deployment:
+  Configure the binary drift policy in Defender for Cloud.
+"@
+    return
 }
 
 # ---------- Deploy Infrastructure ----------
@@ -104,9 +364,13 @@ if ($PSCmdlet.ShouldProcess("Subscription", "Deploy Bicep template")) {
         --template-file $bicepPath `
         --parameters projectName=$ProjectName location=$Location `
         --query 'properties.outputs' -o json | ConvertFrom-Json
+    Assert-LastExitCode -Action 'AKS lab infrastructure deployment'
 
     $clusterName = $deployment.clusterName.value
     $workspaceId = $deployment.workspaceId.value
+    if (-not $clusterName -or -not $workspaceId) {
+        throw 'The infrastructure deployment did not return the expected cluster and workspace outputs.'
+    }
 
     Write-Host "  AKS Cluster:  $clusterName" -ForegroundColor Green
     Write-Host "  Workspace:    $WorkspaceName" -ForegroundColor Green
@@ -120,6 +384,7 @@ if ($PSCmdlet.ShouldProcess("Subscription", "Enable Defender for Containers")) {
         --name Containers `
         --tier Standard `
         -o none 2>$null
+    Assert-LastExitCode -Action 'Defender for Containers plan enablement'
 
     # Enable AntiMalware on the ContainerSensor extension (defaults to False)
     $subscriptionId = $account.id
@@ -128,6 +393,7 @@ if ($PSCmdlet.ShouldProcess("Subscription", "Enable Defender for Containers")) {
         --body '{"properties":{"pricingTier":"Standard","extensions":[{"name":"ContainerSensor","isEnabled":"True","additionalExtensionProperties":{"AntiMalwareEnabled":"True","SecurityGatingEnabled":"True"}},{"name":"ContainerRegistriesVulnerabilityAssessments","isEnabled":"True"},{"name":"AgentlessDiscoveryForKubernetes","isEnabled":"True"},{"name":"ContainerIntegrityContribution","isEnabled":"True"}]}}' `
         --headers 'Content-Type=application/json' `
         -o none 2>$null
+    Assert-LastExitCode -Action 'Defender for Containers extension configuration'
 
     Write-Host "  Defender for Containers: Enabled (with AntiMalware)" -ForegroundColor Green
 }
@@ -140,6 +406,7 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Get AKS credentials")) {
         --resource-group $ResourceGroup `
         --name $clusterName `
         --overwrite-existing
+    Assert-LastExitCode -Action 'AKS kubeconfig update'
 
     Write-Host "  kubectl context set to: $clusterName" -ForegroundColor Green
 }
@@ -148,53 +415,183 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Get AKS credentials")) {
 Write-Host "`n[5/7] Deploying Defender sensor via Helm (with anti-malware)..." -ForegroundColor Yellow
 
 if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
-    $clusterId = az aks show --resource-group $ResourceGroup --name $clusterName --query id -o tsv
-
-    $hasBash = [bool](Get-Command bash -ErrorAction SilentlyContinue)
-    if ($hasBash) {
-        # Use the official Microsoft install script (Linux, macOS, WSL, Cloud Shell)
-        $installScriptUrl = 'https://raw.githubusercontent.com/microsoft/Microsoft-Defender-For-Containers/main/scripts/install_defender_sensor_aks.sh'
-        $installScriptPath = Join-Path ([System.IO.Path]::GetTempPath()) 'install_defender_sensor_aks.sh'
-        Invoke-WebRequest -Uri $installScriptUrl -OutFile $installScriptPath -UseBasicParsing
-
-        bash $installScriptPath --id $clusterId --version latest --antimalware
-    } else {
-        # Native Windows (no bash): install Defender sensor via Helm directly
-        Write-Host "  bash not found — using direct Helm install (Windows native)..." -ForegroundColor Gray
-
-        # Disable existing Defender security profile (if any)
-        az aks update --resource-group $ResourceGroup --name $clusterName --disable-defender -o none 2>$null
-
-        # Get workspace details for the Helm chart
-        $wsCustomerId = az monitor log-analytics workspace show `
-            --resource-group $ResourceGroup --workspace-name $WorkspaceName `
-            --query customerId -o tsv
-        $wsSharedKey = az monitor log-analytics workspace get-shared-keys `
-            --resource-group $ResourceGroup --workspace-name $WorkspaceName `
-            --query primarySharedKey -o tsv
-        $clusterRegion = az aks show --resource-group $ResourceGroup --name $clusterName `
-            --query location -o tsv
-
-        helm upgrade --install microsoft-defender `
-            oci://mcr.microsoft.com/azuredefender/microsoft-defender-for-containers `
-            --version 0.10.2 `
-            --namespace mdc --create-namespace `
-            --set global.clusterName=$clusterName `
-            --set global.subscriptionId=$subscriptionId `
-            --set global.resourceGroupName=$ResourceGroup `
-            --set global.clusterRegion=$clusterRegion `
-            --set global.azsecpackAutoConfigEnabled=true `
-            --set logAnalytics.workspaceId=$wsCustomerId `
-            --set logAnalytics.workspaceKey=$wsSharedKey `
-            --set collectors.antimalwareCollector.enable=true
+    $subscriptionId = $account.id
+    $clusterJson = az aks show `
+        --resource-group $ResourceGroup `
+        --name $clusterName `
+        --output json
+    Assert-LastExitCode -Action 'AKS cluster state lookup'
+    $cluster = ($clusterJson -join "`n") | ConvertFrom-Json
+    $clusterRegion = [string]$cluster.location
+    $clusterId = [string]$cluster.id
+    if (-not $clusterRegion -or -not $clusterId) {
+        throw 'AKS cluster state did not include its location and resource ID.'
     }
 
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "  Defender sensor: Deployed via Helm (with anti-malware)" -ForegroundColor Green
-    } else {
-        Write-Host "  [!] Helm deployment failed. Check errors above." -ForegroundColor Yellow
-        Write-Host "      See: https://learn.microsoft.com/en-us/azure/defender-for-cloud/deploy-helm" -ForegroundColor Gray
+    $priorDefenderEnabled = $false
+    if ($null -ne $cluster.securityProfile.defender.securityMonitoring.enabled) {
+        $priorDefenderEnabled = [bool]$cluster.securityProfile.defender.securityMonitoring.enabled
     }
+    $priorDefenderWorkspaceId = [string]$cluster.securityProfile.defender.logAnalyticsWorkspaceResourceId
+
+    $priorExclusionTag = $null
+    if ($cluster.tags) {
+        $priorExclusionTag = $cluster.tags.PSObject.Properties[$DefenderExclusionTag]
+    }
+    $priorExclusionTagExisted = $null -ne $priorExclusionTag
+    $priorExclusionTagValue = if ($priorExclusionTagExisted) { [string]$priorExclusionTag.Value } else { $null }
+
+    # Microsoft's Helm flow stops before mutation when the auto-provisioning
+    # policy could redeploy a competing managed sensor.
+    $conflictingPolicies = @(Get-ConflictingDefenderPolicyAssignments `
+        -SubscriptionId $subscriptionId `
+        -ResourceGroupName $ResourceGroup)
+    if ($conflictingPolicies.Count -gt 0) {
+        $policySummary = $conflictingPolicies | ForEach-Object {
+            '{0} ({1})' -f $_.name, $_.scope
+        }
+        throw ('Conflicting Defender auto-provision policy assignments found: {0}. Remove or exempt the lab scope before installing the Helm-managed sensor.' -f ($policySummary -join '; '))
+    }
+
+    $helmReleaseJson = helm list --all --namespace mdc --output json
+    Assert-LastExitCode -Action 'Existing Defender Helm release lookup'
+    $helmReleases = if ([string]::IsNullOrWhiteSpace(($helmReleaseJson -join "`n"))) {
+        @()
+    }
+    else {
+        @((($helmReleaseJson -join "`n") | ConvertFrom-Json))
+    }
+    $defenderReleases = @($helmReleases | Where-Object {
+        $_.chart -like 'microsoft-defender-for-containers-*'
+    })
+    $conflictingReleases = @($defenderReleases | Where-Object {
+        $_.name -ne $DefenderHelmReleaseName
+    })
+    if ($conflictingReleases.Count -gt 0) {
+        throw ('A Defender Helm release already exists under a different name: {0}. Reuse or remove that release before continuing.' -f (($conflictingReleases.name | Sort-Object -Unique) -join ', '))
+    }
+
+    $currentReleaseExists = @($defenderReleases | Where-Object {
+        $_.name -eq $DefenderHelmReleaseName
+    }).Count -gt 0
+    $staleClusterResources = if ($currentReleaseExists) {
+        @()
+    }
+    else {
+        @(Get-StaleDefenderClusterResources)
+    }
+    if ($staleClusterResources.Count -gt 0) {
+        Write-Host "  Found $($staleClusterResources.Count) stale managed-sensor cluster resource(s); exact known resources will be removed before Helm." -ForegroundColor Yellow
+    }
+
+    $workspaceCustomerId = az monitor log-analytics workspace show `
+        --resource-group $ResourceGroup `
+        --workspace-name $WorkspaceName `
+        --query customerId `
+        --output tsv
+    Assert-LastExitCode -Action 'Log Analytics workspace ID lookup'
+    $workspaceCustomerId = [string](($workspaceCustomerId | Select-Object -First 1)).Trim()
+
+    $workspaceSharedKey = az monitor log-analytics workspace get-shared-keys `
+        --resource-group $ResourceGroup `
+        --workspace-name $WorkspaceName `
+        --query primarySharedKey `
+        --output tsv
+    Assert-LastExitCode -Action 'Log Analytics workspace key lookup'
+    $workspaceSharedKey = [string](($workspaceSharedKey | Select-Object -First 1)).Trim()
+    if (-not $workspaceCustomerId -or -not $workspaceSharedKey) {
+        throw 'Log Analytics returned an empty workspace ID or shared key; refusing to deploy a sensor that cannot publish telemetry.'
+    }
+
+    # JSON is valid YAML. Keeping every Helm value in a locked-down file avoids
+    # exposing the workspace key through the process command line.
+    $helmValuesObject = @{
+        global = @{
+            cloudIdentifiers = @{
+                Azure = @{
+                    subscriptionId  = $subscriptionId
+                    resourceGroupName = $ResourceGroup
+                    clusterName     = $clusterName
+                    region          = $clusterRegion
+                }
+            }
+        }
+        'microsoft-defender-for-containers-sensor' = @{
+            antimalwareCollector = @{
+                enabled = $true
+            }
+            omsagent = @{
+                secret = @{
+                    wsid = $workspaceCustomerId
+                    key  = $workspaceSharedKey
+                }
+            }
+        }
+    }
+    $helmValuesJson = $helmValuesObject | ConvertTo-Json -Depth 10 -Compress
+    $temporaryValues = New-SecureHelmValuesFile -Content $helmValuesJson
+    $helmValuesObject = $null
+    $helmValuesJson = $null
+
+    try {
+        try {
+            # A Helm-managed sensor must not coexist with the AKS Defender profile.
+            az aks update `
+                --resource-group $ResourceGroup `
+                --name $clusterName `
+                --disable-defender `
+                --output none 2>$null
+            Assert-LastExitCode -Action 'Disabling the automatically managed Defender profile'
+
+            # Exclude this cluster from automatic rediscovery while the sensor is Helm-managed.
+            az tag update `
+                --resource-id $clusterId `
+                --operation merge `
+                --tags "${DefenderExclusionTag}=true" `
+                --output none
+            Assert-LastExitCode -Action 'Applying the Defender Helm-management exclusion tag'
+
+            foreach ($resource in $staleClusterResources) {
+                kubectl delete $resource.Kind $resource.Name --ignore-not-found 2>$null
+                Assert-LastExitCode -Action "Removing stale $($resource.Kind)/$($resource.Name)"
+            }
+
+            helm upgrade --install $DefenderHelmReleaseName `
+                $DefenderHelmChart `
+                --version $DefenderHelmChartVersion `
+                --namespace mdc `
+                --create-namespace `
+                --values $temporaryValues.Path `
+                --atomic `
+                --wait `
+                --timeout 10m
+            Assert-LastExitCode -Action 'Defender sensor Helm deployment'
+        }
+        catch {
+            $deploymentError = $_
+            Write-Warning 'Defender Helm deployment failed. Restoring the cluster protection state captured before installation.'
+            try {
+                Restore-ClusterProtectionState `
+                    -ResourceGroupName $ResourceGroup `
+                    -ClusterName $clusterName `
+                    -ClusterId $clusterId `
+                    -DefenderWasEnabled $priorDefenderEnabled `
+                    -DefenderWorkspaceId $priorDefenderWorkspaceId `
+                    -ExclusionTagExisted $priorExclusionTagExisted `
+                    -ExclusionTagValue $priorExclusionTagValue
+            }
+            catch {
+                throw ('Defender Helm deployment failed: {0} Rollback also failed: {1}' -f $deploymentError.Exception.Message, $_.Exception.Message)
+            }
+            throw ('Defender Helm deployment failed; the prior Defender profile and exclusion-tag state were restored. Cause: {0}' -f $deploymentError.Exception.Message)
+        }
+    }
+    finally {
+        $workspaceSharedKey = $null
+        Remove-SecureHelmValuesFile -TemporaryValues $temporaryValues
+    }
+
+    Write-Host "  Defender sensor: Deployed via Helm chart $DefenderHelmChartVersion (with anti-malware)" -ForegroundColor Green
 
     # Wait for sensor pods to come up
     Write-Host "  Waiting for Defender sensor pods..." -ForegroundColor Gray
@@ -233,8 +630,11 @@ if (-not $SkipSentinel) {
             subscriptionId = $subscriptionId
         }
     } | ConvertTo-Json -Depth 5
-    az rest --method PUT --url $connectorUrl --body $connectorBody --headers 'Content-Type=application/json' -o none 2>$null
-    Write-Host "  Defender for Cloud data connector: Enabled" -ForegroundColor Green
+    if ($PSCmdlet.ShouldProcess('Defender for Cloud data connector', 'Create or update Sentinel data connector')) {
+        az rest --method PUT --url $connectorUrl --body $connectorBody --headers 'Content-Type=application/json' -o none 2>$null
+        Assert-LastExitCode -Action 'Defender for Cloud data-connector deployment'
+        Write-Host "  Defender for Cloud data connector: Enabled" -ForegroundColor Green
+    }
 
     # Rule definitions
     $rules = @(
@@ -367,26 +767,36 @@ AzureDiagnostics
     $workbookPath = Join-Path $LabRoot 'workbook/container-runtime-workbook.json'
     if (Test-Path $workbookPath) {
         $workbookContent = Get-Content $workbookPath -Raw
-        $workbookId = [guid]::NewGuid().ToString()
+        $workbookDisplayName = 'Container Runtime Security Dashboard'
+        $existingWorkbook = @(
+            az resource list `
+                --resource-group $ResourceGroup `
+                --resource-type Microsoft.Insights/workbooks `
+                2>$null | ConvertFrom-Json
+        ) | Where-Object {
+            $_.tags.'hidden-title' -eq $workbookDisplayName
+        } | Select-Object -First 1
+        $workbookId = if ($existingWorkbook) { $existingWorkbook.name } else { [guid]::NewGuid().ToString() }
         $workbookUrl = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.Insights/workbooks/${workbookId}?api-version=2022-04-01"
 
         $workbookBody = @{
             location   = $Location
             kind       = 'shared'
             properties = @{
-                displayName    = 'Container Runtime Security Dashboard'
+                displayName    = $workbookDisplayName
                 category       = 'sentinel'
                 sourceId       = $workspaceId
                 serializedData = $workbookContent
             }
             tags = @{
-                'hidden-title' = 'Container Runtime Security Dashboard'
+                'hidden-title' = $workbookDisplayName
             }
         } | ConvertTo-Json -Depth 10
 
-        if ($PSCmdlet.ShouldProcess("Container Runtime Security Dashboard", "Create workbook")) {
+        if ($PSCmdlet.ShouldProcess($workbookDisplayName, "Create or update workbook")) {
             az rest --method PUT --url $workbookUrl --body $workbookBody --headers 'Content-Type=application/json' -o none 2>$null
-            Write-Host "  Workbook: Container Runtime Security Dashboard" -ForegroundColor Green
+            Assert-LastExitCode -Action 'Sentinel workbook deployment'
+            Write-Host "  Workbook: $workbookDisplayName" -ForegroundColor Green
         }
     } else {
         Write-Host "  [!] Workbook template not found at $workbookPath, skipping." -ForegroundColor Yellow
@@ -397,15 +807,16 @@ AzureDiagnostics
 }
 
 # ---------- Summary ----------
+$sentinelSummary = if ($SkipSentinel) { 'Skipped by request' } else { '4 analytics rules + 1 workbook' }
 Write-Host "`n=== Deployment Complete ===" -ForegroundColor Green
 Write-Host @"
 
 Resources deployed:
-  - AKS Cluster:    $clusterName (1 node, Standard_D4s_v3)
+  - AKS Cluster:    $clusterName (Kubernetes 1.35, 1 node, Standard_D4s_v3)
   - Defender:       Defender for Containers enabled (with AntiMalware extension)
-  - Sensor:         Helm chart v0.10.2+ (anti-malware collector enabled)
+  - Sensor:         Helm chart $DefenderHelmChartVersion (anti-malware collector enabled)
   - Workspace:      $WorkspaceName (Container Insights + Sentinel)
-  - Sentinel:       4 analytics rules + 1 workbook
+  - Sentinel:       $sentinelSummary
 
 IMPORTANT - Manual step required:
   Configure binary drift policy in the Azure portal:
