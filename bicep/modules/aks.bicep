@@ -1,6 +1,6 @@
 // AKS Cluster for Defender for Containers lab
 // Note: Defender sensor is deployed separately via Helm (Deploy-Lab.ps1 step 5)
-// to get v0.10.2+ with anti-malware support.
+// using the version pinned by Deploy-Lab.ps1 (currently 0.11.4).
 
 param projectName string
 param location string
@@ -31,6 +31,7 @@ resource aks 'Microsoft.ContainerService/managedClusters@2024-09-01' = {
         count: nodeCount
         vmSize: nodeVmSize
         osType: 'Linux'
+        // AKS 1.32+ resolves AzureLinux to the supported Azure Linux 3 image.
         osSKU: 'AzureLinux'
         mode: 'System'
         enableAutoScaling: false
@@ -65,8 +66,8 @@ resource aks 'Microsoft.ContainerService/managedClusters@2024-09-01' = {
     }
 
     // Security profile - workload identity only
-    // Defender sensor is deployed via Helm chart (Deploy-Lab.ps1) for v0.10.2+
-    // which includes anti-malware collector and drift blocking support.
+    // Defender sensor is deployed with the chart version pinned by Deploy-Lab.ps1
+    // (currently 0.11.4), including the anti-malware collector.
     securityProfile: {
       workloadIdentity: {
         enabled: true

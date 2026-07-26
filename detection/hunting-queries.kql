@@ -38,7 +38,7 @@ AzureDiagnostics
 | extend Resource = tostring(RequestObject.objectRef.resource)
 | extend Namespace = tostring(RequestObject.objectRef.namespace)
 | where Groups has "system:masters" or Username has "admin"
-| where Username !has_any (KnownAdmins)
+| where not(Username has_any (KnownAdmins))
 | where Verb in ("create", "delete", "patch", "update")
 | project TimeGenerated, Username, Verb, Resource,
     Namespace, Groups

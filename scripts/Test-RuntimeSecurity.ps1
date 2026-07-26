@@ -11,6 +11,13 @@
 
     Each test generates alerts in Defender for Cloud (5-15 minute delay).
 
+.PARAMETER ProjectName
+    Lab project name. Must match the AKS cluster the tests are allowed to touch.
+    Defaults to the same value Deploy-Lab.ps1 uses.
+
+.PARAMETER Namespace
+    Namespace the test pods are created in and deleted with. Created if absent.
+
 .PARAMETER SkipDrift
     Skip the binary drift test.
 
@@ -27,6 +34,8 @@
 
 [CmdletBinding()]
 param(
+    [string]$ProjectName = 'aks-runtime-lab',
+    [string]$Namespace = 'runtime-security-tests',
     [switch]$SkipDrift,
     [switch]$SkipMalware,
     [switch]$SkipGated
@@ -40,21 +49,33 @@ Write-Host "These tests generate real Defender alerts (5-15 min delay).`n"
 # ---------- Pre-flight ----------
 $context = kubectl config current-context 2>$null
 if (-not $context) {
-    Write-Error "No kubectl context set. Run: az aks get-credentials --resource-group aks-runtime-lab-rg --name aks-runtime-lab"
+    throw "No kubectl context set. Run: az aks get-credentials --resource-group $ProjectName-rg --name $ProjectName"
 }
-Write-Host "kubectl context: $context`n"
+if ($context -ne $ProjectName) {
+    throw @"
+Refusing to run. The current kubectl context is '$context', not the lab cluster '$ProjectName'.
+These tests execute a dropped binary and write the EICAR test file inside a running
+container, so they must never touch a cluster that is not the lab. Either switch context
+with 'az aks get-credentials --resource-group $ProjectName-rg --name $ProjectName', or pass
+-ProjectName if your lab cluster genuinely has a different name.
+"@
+}
+Write-Host "kubectl context: $context"
+
+kubectl create namespace $Namespace --dry-run=client -o yaml | kubectl apply -f - | Out-Null
+Write-Host "test namespace: $Namespace`n"
 
 # ---------- Test 1: Binary Drift ----------
 if (-not $SkipDrift) {
     Write-Host "[Test 1/3] Binary Drift Detection" -ForegroundColor Yellow
     Write-Host "  Deploying clean nginx container..."
 
-    kubectl delete pod drift-test --ignore-not-found=true --wait=true 2>$null
-    kubectl run drift-test --image=nginx:latest --restart=Never --labels="test=drift" 2>$null
-    kubectl wait --for=condition=Ready pod/drift-test --timeout=120s
+    kubectl delete pod drift-test -n $Namespace --ignore-not-found=true --wait=true 2>$null
+    kubectl run drift-test -n $Namespace --image=nginx:1.27-alpine --restart=Never --labels="test=drift" 2>$null
+    kubectl wait -n $Namespace --for=condition=Ready pod/drift-test --timeout=120s
 
     Write-Host "  Introducing binary drift (creating + executing script not in image)..."
-    kubectl exec drift-test -- /bin/sh -c @"
+    kubectl exec drift-test -n $Namespace -- /bin/sh -c @"
 cat > /tmp/drift-binary.sh << 'SCRIPT'
 #!/bin/sh
 echo 'This binary is not part of the original image'
@@ -75,14 +96,14 @@ if (-not $SkipMalware) {
     Write-Host "[Test 2/3] Container Anti-Malware (EICAR)" -ForegroundColor Yellow
     Write-Host "  Deploying clean nginx container..."
 
-    kubectl delete pod malware-test --ignore-not-found=true --wait=true 2>$null
-    kubectl run malware-test --image=nginx:latest --restart=Never --labels="test=malware" 2>$null
-    kubectl wait --for=condition=Ready pod/malware-test --timeout=120s
+    kubectl delete pod malware-test -n $Namespace --ignore-not-found=true --wait=true 2>$null
+    kubectl run malware-test -n $Namespace --image=nginx:1.27-alpine --restart=Never --labels="test=malware" 2>$null
+    kubectl wait -n $Namespace --for=condition=Ready pod/malware-test --timeout=120s
 
     Write-Host "  Writing EICAR test file into container..."
     # EICAR test string (base64-encoded to avoid shell escaping issues)
     # This is NOT malware, it's the standard 68-byte AV test file
-    kubectl exec malware-test -- /bin/sh -c "echo 'WDVPIVAlQEFQWzRcUFpYNTQoUF4pN0NDKTd9JEVJQ0FSLVNUQU5EQVJELUFOVElWSVJVUy1URVNULUZJTEUhJEgrSCo=' | base64 -d > /tmp/eicar.com"
+    kubectl exec malware-test -n $Namespace -- /bin/sh -c "echo 'WDVPIVAlQEFQWzRcUFpYNTQoUF4pN0NDKTd9JEVJQ0FSLVNUQU5EQVJELUFOVElWSVJVUy1URVNULUZJTEUhJEgrSCo=' | base64 -d > /tmp/eicar.com"
 
     Write-Host "  EICAR test complete." -ForegroundColor Green
     Write-Host "  Expected alert: 'Malicious file detected' (High severity)"
@@ -95,10 +116,10 @@ if (-not $SkipGated) {
     Write-Host "[Test 3/3] Gated Deployment (Vulnerable Image)" -ForegroundColor Yellow
     Write-Host "  Attempting to deploy nginx 1.14.0 (known critical CVEs)..."
 
-    kubectl delete pod vuln-test --ignore-not-found=true --wait=true 2>$null
+    kubectl delete pod vuln-test -n $Namespace --ignore-not-found=true --wait=true 2>$null
 
     # This may be blocked by the admission webhook if gated deployment is in Deny mode
-    $result = kubectl run vuln-test --image=nginx:1.14.0 --restart=Never --labels="test=gated" 2>&1
+    $result = kubectl run vuln-test -n $Namespace --image=nginx:1.14.0 --restart=Never --labels="test=gated" 2>&1
 
     if ($result -match "denied|Forbidden|blocked") {
         Write-Host "  Deployment BLOCKED by gated deployment." -ForegroundColor Green
@@ -134,6 +155,6 @@ All test scenarios executed. Monitor for alerts in:
      | project TimeGenerated, AlertName, AlertSeverity, Description
 
 Cleanup test pods:
-  kubectl delete pod drift-test malware-test vuln-test --ignore-not-found
+  kubectl delete pod drift-test malware-test vuln-test -n $Namespace --ignore-not-found
 
 "@
