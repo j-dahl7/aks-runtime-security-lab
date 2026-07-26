@@ -26,20 +26,27 @@ param nodeVmSize string = 'Standard_D4s_v3'
 param nodeCount int = 1
 
 @description('Kubernetes version')
-param kubernetesVersion string = '1.32'
+param kubernetesVersion string = '1.35'
 
 @description('Additional tags for all resources')
 param tags object = {}
+
+@secure()
+@description('Per-deployment ownership token used to prevent resource-group adoption')
+param ownerToken string
+
+var labTags = union({
+  project: projectName
+  environment: 'lab'
+  purpose: 'aks-runtime-security-demo'
+  'nlzt-owner': ownerToken
+}, tags)
 
 // ---------- Resource Group ----------
 resource resourceGroup 'Microsoft.Resources/resourceGroups@2023-07-01' = {
   name: '${projectName}-rg'
   location: location
-  tags: union({
-    project: projectName
-    environment: 'lab'
-    purpose: 'aks-runtime-security-demo'
-  }, tags)
+  tags: labTags
 }
 
 // ---------- Log Analytics Workspace ----------
@@ -49,7 +56,7 @@ module monitoring 'modules/monitoring.bicep' = {
   params: {
     projectName: projectName
     location: location
-    tags: tags
+    tags: labTags
   }
 }
 
@@ -64,12 +71,13 @@ module aks 'modules/aks.bicep' = {
     nodeVmSize: nodeVmSize
     nodeCount: nodeCount
     logAnalyticsWorkspaceId: monitoring.outputs.workspaceId
-    tags: tags
+    tags: labTags
   }
 }
 
 // ---------- Outputs ----------
 output resourceGroupName string = resourceGroup.name
+output resourceGroupId string = resourceGroup.id
 output clusterName string = aks.outputs.clusterName
 output workspaceId string = monitoring.outputs.workspaceId
 output workspaceName string = monitoring.outputs.workspaceName

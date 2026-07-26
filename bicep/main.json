@@ -4,8 +4,8 @@
   "metadata": {
     "_generator": {
       "name": "bicep",
-      "version": "0.40.2.10011",
-      "templateHash": "9312102830503460763"
+      "version": "0.45.6.27763",
+      "templateHash": "2504088582892524740"
     }
   },
   "parameters": {
@@ -43,7 +43,7 @@
     },
     "kubernetesVersion": {
       "type": "string",
-      "defaultValue": "1.32",
+      "defaultValue": "1.35",
       "metadata": {
         "description": "Kubernetes version"
       }
@@ -91,8 +91,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.40.2.10011",
-              "templateHash": "8356077328036367213"
+              "version": "0.45.6.27763",
+              "templateHash": "17138775081757722891"
             }
           },
           "parameters": {
@@ -209,8 +209,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.40.2.10011",
-              "templateHash": "4032508362319899503"
+              "version": "0.45.6.27763",
+              "templateHash": "15469427856855403230"
             }
           },
           "parameters": {
