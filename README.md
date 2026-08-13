@@ -4,9 +4,9 @@ Deploy three layers of AKS runtime defense with Microsoft Defender for Cloud:
 
 | Layer | Feature | Status | What It Does |
 |---|---|---|---|
-| **Deploy-time gate** | Gated Deployment | GA | Admission control blocks images with unresolved critical CVEs |
-| **Runtime detection** | Binary Drift | GA detect / Preview block | Catches executables not in the original container image |
-| **Runtime protection** | Container Anti-Malware | Preview | Real-time malware detection and blocking inside running containers |
+| **Deploy-time gate** | Gated Deployment | GA | Evaluates images at admission; configured rules can audit or deny matching images |
+| **Runtime detection** | Binary Drift | GA | Detects or blocks executables that differ from the original container image |
+| **Runtime protection** | Container Anti-Malware | GA | Real-time malware detection and blocking inside running containers |
 
 Companion lab for the blog post: [AKS Runtime Security: Binary Drift, Anti-Malware & Gated Deployment with Defender for Cloud](https://nineliveszerotrust.com/blog/aks-runtime-security-defender/)
 
@@ -15,8 +15,8 @@ Companion lab for the blog post: [AKS Runtime Security: Binary Drift, Anti-Malwa
 The hardened July 25, 2026 revision was validated with Bicep compilation,
 PowerShell parsing, and mocked safety/rollback tests. It was not freshly
 deployed to Azure, and no live AKS, Defender, Helm, Sentinel, or alert-ingestion
-validation was performed for this revision. Feature availability, preview
-status, policy behavior, chart availability, and alert latency can vary by
+validation was performed for this revision. Feature availability, policy
+behavior, chart availability, and alert latency can vary by
 subscription, region, and cluster version.
 
 ## Prerequisites
@@ -91,7 +91,7 @@ Deployment parameters are `-Location`, `-ProjectName`, `-SkipSentinel`,
 `-EnableSentinelRules`, `-Destroy`, and PowerShell's common `-WhatIf` switch. The test helper accepts
 `-ProjectName`, `-Namespace`, `-SkipDrift`, `-SkipMalware`, and `-SkipGated`.
 
-> **Portal step required:** After deployment, configure the **binary drift policy** in Defender for Cloud > Environment Settings > Containers drift policy. The default is "Ignore drift detection" — change it to "Drift detection alert" (or "Block" in Preview). There is no REST API for this setting.
+> **Portal steps required before testing:** Configure the **binary drift policy** in Defender for Cloud > Environment Settings > Containers drift policy. The default is "Ignore drift detection"; change it to "Drift detection alert" or "Drift detection blocking". Then create a gated-deployment vulnerability-assessment rule under Environment Settings > Security Rules. Start with **Audit**, validate its matches, and move to **Deny** only when the intended scope and thresholds are correct. The deployment script does not create either policy.
 
 ## What Gets Deployed
 
