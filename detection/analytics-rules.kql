@@ -48,28 +48,7 @@ SecurityAlert
     PodName, ContainerName
 
 // ============================================================
-// Rule 3: Vulnerable Image Deployment Attempted
-// Severity: Medium | Frequency: 5m | Period: 1h
-// MITRE: T1610, T1190
-// ============================================================
-SecurityAlert
-| where AlertType has "GatedDeployment"
-    or AlertName has_any ("deployment was blocked", "vulnerable image")
-| extend ExtProps = parse_json(ExtendedProperties)
-| extend ImageName = coalesce(
-    tostring(ExtProps["Image Name"]),
-    tostring(ExtProps["ImageName"]),
-    extract(@"[Ii]mage[:\s]+([^\s,]+)", 1, Description))
-| extend ClusterName = CompromisedEntity
-| extend VulnCount = coalesce(
-    tostring(ExtProps["Vulnerability Count"]),
-    extract(@"(\d+)\s+vulnerabilit", 1, Description))
-| where isnotempty(ImageName)
-| project TimeGenerated, AlertSeverity, ImageName,
-    ClusterName, VulnCount, Description
-
-// ============================================================
-// Rule 4: Suspicious kubectl exec into Container
+// Rule 3: Suspicious kubectl exec into Container
 // Severity: Medium | Frequency: 5m | Period: 1h
 // MITRE: T1609
 // ============================================================

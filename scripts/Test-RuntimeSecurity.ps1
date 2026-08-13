@@ -4,12 +4,14 @@
     Runs test scenarios against the AKS Runtime Security Lab.
 
 .DESCRIPTION
-    Executes three test scenarios to validate runtime security:
+    Exercises three runtime-security scenarios:
     1. Binary drift - drops and executes a script not in the original image
-    2. Anti-malware - writes the EICAR test file into a container
-    3. Gated deployment - attempts to deploy an image with known critical CVEs
+    2. Anti-malware - writes and attempts to execute the EICAR test file
+    3. Gated deployment - attempts Microsoft's documented test image
 
-    Each test generates alerts in Defender for Cloud (5-15 minute delay).
+    Results depend on enabled policies, sensor health, telemetry ingestion, and
+    service-side processing. Gated-deployment decisions are reviewed in
+    Admission Monitoring rather than inferred from an undocumented alert type.
 
 .PARAMETER ProjectName
     Lab project name. Must match the AKS cluster the tests are allowed to touch.
@@ -44,7 +46,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 Write-Host "`n=== AKS Runtime Security Test Scenarios ===" -ForegroundColor Cyan
-Write-Host "These tests generate real Defender alerts (5-15 min delay).`n"
+Write-Host "These tests exercise configured controls; they do not guarantee alerts or fixed latency.`n"
 
 # ---------- Pre-flight ----------
 $context = kubectl config current-context 2>$null
@@ -54,8 +56,8 @@ if (-not $context) {
 if ($context -ne $ProjectName) {
     throw @"
 Refusing to run. The current kubectl context is '$context', not the lab cluster '$ProjectName'.
-These tests execute a dropped binary and write the EICAR test file inside a running
-container, so they must never touch a cluster that is not the lab. Either switch context
+These tests execute a dropped binary and write and execute the EICAR test file inside a
+running container, so they must never touch a cluster that is not the lab. Either switch context
 with 'az aks get-credentials --resource-group $ProjectName-rg --name $ProjectName', or pass
 -ProjectName if your lab cluster genuinely has a different name.
 "@
@@ -86,9 +88,9 @@ chmod +x /tmp/drift-binary.sh
 /tmp/drift-binary.sh
 "@
 
-    Write-Host "  Binary drift test complete." -ForegroundColor Green
-    Write-Host "  Expected alert: 'Binary drift detected' (Medium/High severity)"
-    Write-Host "  Alert delay: 5-15 minutes`n"
+    Write-Host "  Binary drift activity submitted." -ForegroundColor Green
+    Write-Host "  Review the configured drift action and Defender security alerts."
+    Write-Host "  Detection/blocking and alert ingestion are asynchronous; no fixed latency is promised.`n"
 }
 
 # ---------- Test 2: Anti-Malware (EICAR) ----------
@@ -104,54 +106,77 @@ if (-not $SkipMalware) {
     # EICAR test string (base64-encoded to avoid shell escaping issues)
     # This is NOT malware, it's the standard 68-byte AV test file
     kubectl exec malware-test -n $Namespace -- /bin/sh -c "echo 'WDVPIVAlQEFQWzRcUFpYNTQoUF4pN0NDKTd9JEVJQ0FSLVNUQU5EQVJELUFOVElWSVJVUy1URVNULUZJTEUhJEgrSCo=' | base64 -d > /tmp/eicar.com"
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Writing the EICAR test file failed; the execution stage was not attempted.'
+    }
 
-    Write-Host "  EICAR test complete." -ForegroundColor Green
-    Write-Host "  Expected alert: 'Malicious file detected' (High severity)"
-    Write-Host "  In block mode, the write process may be killed."
-    Write-Host "  Alert delay: 5-15 minutes`n"
+    Write-Host "  Marking the file executable and attempting execution..."
+    kubectl exec malware-test -n $Namespace -- /bin/sh -c "chmod +x /tmp/eicar.com"
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Making the EICAR test file executable failed; the execution stage was not attempted.'
+    }
+    $malwareResult = kubectl exec malware-test -n $Namespace -- /bin/sh -c "/tmp/eicar.com" 2>&1
+    $malwareExitCode = $LASTEXITCODE
+    Write-Host "  EICAR execution was attempted (container command exit $malwareExitCode)." -ForegroundColor Green
+    Write-Host "  Runtime anti-malware evaluates execution, not the file write alone."
+    Write-Host "  A nonzero command exit does not by itself prove Defender blocked it; inspect"
+    Write-Host "  the configured anti-malware action and Defender security alerts. Policy updates"
+    Write-Host "  can take up to 30 minutes to reach sensors, and alert latency varies.`n"
 }
 
 # ---------- Test 3: Gated Deployment ----------
 if (-not $SkipGated) {
-    Write-Host "[Test 3/3] Gated Deployment (Vulnerable Image)" -ForegroundColor Yellow
-    Write-Host "  Attempting to deploy nginx 1.14.0 (known critical CVEs)..."
+    Write-Host "[Test 3/3] Gated Deployment (Microsoft Test Image)" -ForegroundColor Yellow
+    $gatedTestImage = 'mcr.microsoft.com/mdc/dev/defender-admission-controller/test-images:one-high'
+    Write-Host "  Attempting Microsoft's documented gated-deployment test image:"
+    Write-Host "  $gatedTestImage"
 
     kubectl delete pod vuln-test -n $Namespace --ignore-not-found=true --wait=true 2>$null
 
-    # This may be blocked by the admission webhook if gated deployment is in Deny mode
-    $result = kubectl run vuln-test -n $Namespace --image=nginx:1.14.0 --restart=Never --labels="test=gated" 2>&1
+    # Deny mode returns an admission-webhook error. Audit mode allows the pod and
+    # records the decision in Defender for Cloud Admission Monitoring.
+    $result = kubectl run vuln-test -n $Namespace --image=$gatedTestImage --restart=Never --labels="test=gated" 2>&1
+    $gatedExitCode = $LASTEXITCODE
 
-    if ($result -match "denied|Forbidden|blocked") {
-        Write-Host "  Deployment BLOCKED by gated deployment." -ForegroundColor Green
-        Write-Host "  This is the expected behavior in Deny mode."
+    if ($gatedExitCode -ne 0 -and $result -match "admission webhook|denied|Forbidden|blocked") {
+        Write-Host "  Admission request was denied by the webhook." -ForegroundColor Green
+        Write-Host "  Confirm the matching rule and violations in Admission Monitoring."
+    } elseif ($gatedExitCode -ne 0) {
+        Write-Host "  kubectl failed without a recognizable gating decision (exit $gatedExitCode)." -ForegroundColor Yellow
+        Write-Host "  Treat this run as inconclusive and inspect the command output and cluster state."
     } else {
-        Write-Host "  Deployment succeeded (Audit mode or gated deployment not configured)." -ForegroundColor Yellow
-        Write-Host "  Check Defender for Cloud > Recommendations for the audit finding."
+        Write-Host "  Admission request was allowed." -ForegroundColor Yellow
+        Write-Host "  This can mean Audit mode, no matching rule, missing findings artifacts, or"
+        Write-Host "  incomplete gating prerequisites; Admission Monitoring is authoritative."
     }
 
-    Write-Host "  Alert delay: 5-15 minutes`n"
+    Write-Host "  Review: Defender for Cloud > Environment settings > Security rules >"
+    Write-Host "          Gated deployment > Admission Monitoring`n"
 }
 
 # ---------- Summary ----------
 Write-Host "=== Test Summary ===" -ForegroundColor Cyan
 Write-Host @"
 
-All test scenarios executed. Monitor for alerts in:
+Selected scenarios were attempted. Review each control in its documented surface:
 
-  1. Defender for Cloud > Security Alerts:
+  1. Binary drift and anti-malware - Defender for Cloud > Security Alerts:
      https://portal.azure.com/#view/Microsoft_Azure_Security/SecurityMenuBlade/~/SecurityAlerts
 
-  2. Defender XDR > Incidents:
+  2. Gated deployment - Defender for Cloud > Environment settings >
+     Security rules > Gated deployment > Admission Monitoring
+
+  3. Defender XDR > Incidents:
      https://security.microsoft.com/incidents
 
-  3. Sentinel > Incidents (after analytics rules fire):
+  4. Sentinel > Incidents (after the runtime rules fire):
      https://security.microsoft.com/sentinel-incidents
 
-  4. KQL query in Log Analytics:
+  5. Runtime-alert KQL in Log Analytics:
      SecurityAlert
      | where TimeGenerated > ago(1h)
      | where ProductName == "Microsoft Defender for Cloud"
-     | where AlertType has_any ("DriftDetection", "BinaryDrift", "MalwareDetected", "GatedDeployment")
+     | where AlertType has_any ("DriftDetection", "BinaryDrift", "MalwareDetected")
      | project TimeGenerated, AlertName, AlertSeverity, Description
 
 Cleanup test pods:
