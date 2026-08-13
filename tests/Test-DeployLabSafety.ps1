@@ -7,6 +7,8 @@ $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 $DeployScript = Join-Path $Root 'scripts/Deploy-Lab.ps1'
 $RuntimeTestScript = Join-Path $Root 'scripts/Test-RuntimeSecurity.ps1'
+$AnalyticsRules = Join-Path $Root 'detection/analytics-rules.kql'
+$Workbook = Join-Path $Root 'workbook/container-runtime-workbook.json'
 $StatePath = Join-Path $Root '.aks-runtime-lab-state-aks-runtime-lab.json'
 $global:AksMockSubscriptionId = '00000000-0000-0000-0000-000000000000'
 $global:AksMockResourceGroupId = "/subscriptions/$global:AksMockSubscriptionId/resourceGroups/aks-runtime-lab-rg"
@@ -59,6 +61,8 @@ function Reset-MockState {
     $global:AksMockPodsReady = $true
     $global:AksMockRulePutShouldFail = $false
     $global:AksMockForeignWorkbook = $false
+    $global:AksMockLegacyGatedRuleId = $null
+    $global:AksMockLegacyGatedRuleExists = $false
     $global:AksMockResourceGroupExists = $false
     $global:AksMockOwnerToken = $null
     $global:AksMockValuesFilePath = $null
@@ -128,6 +132,28 @@ function global:az {
         }
         if ($restMethod -eq 'GET' -and $url -match '/alertRules\?') {
             return '{"value":[]}'
+        }
+        if (
+            $restMethod -eq 'GET' -and
+            $global:AksMockLegacyGatedRuleExists -and
+            $global:AksMockLegacyGatedRuleId -and
+            $url -match "/alertRules/$([regex]::Escape($global:AksMockLegacyGatedRuleId))\?"
+        ) {
+            return (@{
+                name = $global:AksMockLegacyGatedRuleId
+                properties = @{
+                    displayName = 'LAB - Vulnerable Image Deployment Attempted'
+                    description = "deprecated [Owner: $global:AksMockOwnerToken]"
+                }
+            } | ConvertTo-Json -Depth 5 -Compress)
+        }
+        if (
+            $restMethod -eq 'DELETE' -and
+            $global:AksMockLegacyGatedRuleId -and
+            $url -match "/alertRules/$([regex]::Escape($global:AksMockLegacyGatedRuleId))\?"
+        ) {
+            $global:AksMockLegacyGatedRuleExists = $false
+            return
         }
         if ($restMethod -eq 'GET' -and $url -match '/workbooks/' -and $global:AksMockForeignWorkbook) {
             return '{"name":"foreign","properties":{"displayName":"Foreign"},"tags":{"nlzt-owner":"foreign"}}'
@@ -214,8 +240,17 @@ function global:Start-Sleep { param() }
 
 try {
     $runtimeSource = Get-Content -LiteralPath $RuntimeTestScript -Raw
+    $analyticsSource = Get-Content -LiteralPath $AnalyticsRules -Raw
+    $workbookSource = Get-Content -LiteralPath $Workbook -Raw
     Assert-Condition ($runtimeSource -match "\[string\]\`$ProjectName\s*=\s*'aks-runtime-lab'") 'Runtime helper lacks ProjectName boundary.'
     Assert-Condition ($runtimeSource -match "\[string\]\`$Namespace\s*=\s*'runtime-security-tests'") 'Runtime helper lacks namespace boundary.'
+    Assert-Condition ($runtimeSource -match 'chmod \+x /tmp/eicar\.com' -and $runtimeSource -match '"/tmp/eicar\.com"') 'Anti-malware test does not attempt EICAR execution.'
+    Assert-Condition ($runtimeSource -match 'mcr\.microsoft\.com/mdc/dev/defender-admission-controller/test-images:one-high') 'Gated deployment does not use Microsoft''s documented test image.'
+    Assert-Condition ($runtimeSource -match 'Admission Monitoring') 'Gated deployment results are not routed to Admission Monitoring.'
+    Assert-Condition ($runtimeSource -notmatch 'nginx:1\.14\.0') 'Runtime helper still relies on a stale arbitrary image tag.'
+    Assert-Condition ($analyticsSource -notmatch 'GatedDeployment|Vulnerable Image Deployment Attempted') 'Standalone rules still invent a gated-deployment SecurityAlert schema.'
+    Assert-Condition ($workbookSource -notmatch '"GatedDeployment"') 'Workbook still queries an undocumented gated-deployment alert type.'
+    $null = $workbookSource | ConvertFrom-Json
 
     Reset-MockState
     $preview = & $DeployScript -WhatIf -SkipSentinel 6>&1 | Out-String
@@ -263,9 +298,24 @@ try {
     Reset-MockState -PricingConfigured $true
     $sentinelOutput = & $DeployScript 6>&1 | Out-String
     $sentinelMutations = @($global:AksMockMutationCalls | Where-Object { $_ -match 'alertRules/.+--body' })
-    Assert-Condition ($sentinelMutations.Count -eq 4) "Expected four rule writes, found $($sentinelMutations.Count)."
-    Assert-Condition ($sentinelOutput -match '4 disabled owned analytics rules') 'Default rule state was not reported as disabled.'
+    Assert-Condition ($sentinelMutations.Count -eq 3) "Expected three rule writes, found $($sentinelMutations.Count)."
+    Assert-Condition ($sentinelOutput -match '3 disabled owned analytics rules') 'Default rule state was not reported as disabled.'
     Assert-Condition (($global:AksMockMutationCalls -join "`n") -match 'workbooks/.+--method PUT|--method PUT.+workbooks/') 'Owned workbook was not written.'
+
+    $legacyState = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
+    $global:AksMockLegacyGatedRuleId = '22222222-2222-2222-2222-222222222222'
+    $global:AksMockLegacyGatedRuleExists = $true
+    $legacyState.sentinelRules = @($legacyState.sentinelRules) + @(
+        [pscustomobject]@{ slug = 'gated-deployment-block'; id = $global:AksMockLegacyGatedRuleId }
+    )
+    $legacyState | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $StatePath -Encoding utf8NoBOM
+    $beforeMigrationCallCount = $global:AksMockMutationCalls.Count
+    $migrationOutput = & $DeployScript 6>&1 | Out-String
+    $migrationCalls = @($global:AksMockMutationCalls | Select-Object -Skip $beforeMigrationCallCount)
+    Assert-Condition (($migrationCalls -join "`n") -match "--method DELETE.+alertRules/$global:AksMockLegacyGatedRuleId") 'Manifest-owned legacy gated rule was not deleted.'
+    Assert-Condition ($migrationOutput -match 'Deprecated gated-deployment Sentinel rule: Removed') 'Legacy-rule migration was not reported.'
+    $migratedState = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
+    Assert-Condition (@($migratedState.sentinelRules | Where-Object slug -eq 'gated-deployment-block').Count -eq 0) 'Legacy rule remained in the ownership manifest.'
 
     Reset-MockState -PricingConfigured $true
     $global:AksMockRulePutShouldFail = $true

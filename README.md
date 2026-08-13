@@ -1,6 +1,6 @@
 # AKS Runtime Security Lab
 
-Deploy three layers of AKS runtime defense with Microsoft Defender for Cloud:
+Prepare a dedicated AKS lab for three layers of Microsoft Defender for Cloud controls:
 
 | Layer | Feature | Status | What It Does |
 |---|---|---|---|
@@ -12,7 +12,7 @@ Companion lab for the blog post: [AKS Runtime Security: Binary Drift, Anti-Malwa
 
 ## Validation Boundary
 
-The hardened July 25, 2026 revision was validated with Bicep compilation,
+The August 13, 2026 source-audited revision was validated with Bicep compilation,
 PowerShell parsing, and mocked safety/rollback tests. It was not freshly
 deployed to Azure, and no live AKS, Defender, Helm, Sentinel, or alert-ingestion
 validation was performed for this revision. Feature availability, policy
@@ -43,6 +43,15 @@ Kubernetes/Defender matrix:
 helm show chart oci://mcr.microsoft.com/azuredefender/microsoft-defender-for-containers --version 0.11.4
 ```
 
+A Helm-managed sensor is not upgraded automatically; the operator owns chart
+review and upgrades. Microsoft also notes that the portal can label a
+Helm-installed subscription `not supported for Gated deployment`. If the gated
+rule flow offers to auto-install components, choose **Skip** so it does not
+conflict with the existing Helm deployment. This lab uses standard AKS and the
+`mdc` namespace; AKS Automatic has separate `kube-system` requirements. Review
+[Microsoft's current Helm guidance](https://learn.microsoft.com/en-us/azure/defender-for-cloud/deploy-helm)
+before a live run.
+
 ## Quick Start
 
 ```bash
@@ -69,7 +78,7 @@ $env:CONFIRM_SUBSCRIPTION_SCOPE = 'ENABLE-DEFENDER-FOR-CONTAINERS'
 # Live deployment: AKS + Defender + Helm sensor + disabled Sentinel rules + workbook
 ./scripts/Deploy-Lab.ps1 -Location "eastus" -ProjectName "aks-runtime-lab"
 
-# After reviewing the queries, explicitly enable the four rules.
+# After reviewing the queries, explicitly enable the three rules.
 ./scripts/Deploy-Lab.ps1 -Location "eastus" -ProjectName "aks-runtime-lab" -EnableSentinelRules
 ```
 
@@ -91,7 +100,13 @@ Deployment parameters are `-Location`, `-ProjectName`, `-SkipSentinel`,
 `-EnableSentinelRules`, `-Destroy`, and PowerShell's common `-WhatIf` switch. The test helper accepts
 `-ProjectName`, `-Namespace`, `-SkipDrift`, `-SkipMalware`, and `-SkipGated`.
 
-> **Portal steps required before testing:** Configure the **binary drift policy** in Defender for Cloud > Environment Settings > Containers drift policy. The default is "Ignore drift detection"; change it to "Drift detection alert" or "Drift detection blocking". Then create a gated-deployment vulnerability-assessment rule under Environment Settings > Security Rules. Start with **Audit**, validate its matches, and move to **Deny** only when the intended scope and thresholds are correct. The deployment script does not create either policy.
+> **Portal steps required before testing:** Configure the **binary drift policy** in Defender for Cloud > Environment Settings > Containers drift policy. The default is "Ignore drift detection"; change it to "Drift detection alert" or "Drift detection blocking". Review the anti-malware rules and chosen Alert/Block action; Microsoft says policy changes can take up to 30 minutes to reach sensors. Then create a gated-deployment vulnerability-assessment rule under Environment Settings > Security Rules. Start with **Audit**, validate its decisions in **Gated deployment > Admission Monitoring**, and move to **Deny** only when the intended scope and thresholds are correct. The deployment script does not create these policies.
+
+Gated deployment requires Kubernetes 1.31 or later, OIDC on AKS, Defender
+sensor with Security Gating, Registry access with Security findings, and
+vulnerability findings artifacts for evaluated images. The lab deploys AKS
+1.35 with OIDC, but you must verify every service-side prerequisite and artifact
+before attributing an allow/deny result to a policy.
 
 ## What Gets Deployed
 
@@ -101,7 +116,7 @@ Deployment parameters are `-Location`, `-ProjectName`, `-SkipSentinel`,
 | Defender Sensor | Helm Chart | Bundle-tested pin `0.11.4` with anti-malware collector (`mdc` namespace) |
 | `aks-runtime-lab-law` | Log Analytics | Container Insights + Microsoft Sentinel |
 | Defender for Containers | Security Plan | Subscription-level enablement |
-| 4 Analytics Rules | Sentinel | Binary drift, malware, gated deployment, kubectl exec |
+| 3 Analytics Rules | Sentinel | Binary drift, malware, kubectl exec |
 | 1 Workbook | Sentinel | Container Runtime Security Dashboard |
 
 ## Repository Structure
@@ -113,7 +128,7 @@ Deployment parameters are `-Location`, `-ProjectName`, `-SkipSentinel`,
 │       ├── aks.bicep               # AKS cluster + diagnostics (sensor via Helm)
 │       └── monitoring.bicep        # Log Analytics + Sentinel + Container Insights
 ├── detection/
-│   ├── analytics-rules.kql         # 4 Sentinel analytics rules
+│   ├── analytics-rules.kql         # 3 Sentinel analytics rules
 │   └── hunting-queries.kql         # 3 proactive hunting queries
 ├── scripts/
 │   ├── Deploy-Lab.ps1              # One-command deployment
@@ -134,34 +149,43 @@ kubectl exec drift-test -- /bin/sh -c \
   "echo '#!/bin/sh' > /tmp/notinimage.sh && chmod +x /tmp/notinimage.sh && /tmp/notinimage.sh"
 ```
 
-**Expected signal:** a binary-drift alert if the feature and policy are enabled.
-Alert generation and ingestion are asynchronous and are not guaranteed within a
-fixed window.
+**Validation boundary:** the activity should be evaluated when binary drift is
+enabled, but the observed alert/block behavior depends on the selected policy.
+Alert generation and ingestion are asynchronous and are not guaranteed within
+a fixed window.
 
 ### Test 2: Anti-Malware (EICAR)
 
-Writes the [EICAR test file](https://www.eicar.org/download-anti-malware-testfile/) into a running container.
+Writes the [EICAR test file](https://www.eicar.org/download-anti-malware-testfile/), marks it executable, and attempts to execute it in a running container. Runtime anti-malware evaluates executable launch; writing the file alone is not the documented trigger.
 
 ```bash
 kubectl run malware-test --image=nginx:latest --restart=Never
 kubectl exec malware-test -- /bin/sh -c \
-  "echo 'WDVPIVAlQEFQWzRcUFpYNTQoUF4pN0NDKTd9JEVJQ0FSLVNUQU5EQVJELUFOVElWSVJVUy1URVNULUZJTEUhJEgrSCo=' | base64 -d > /tmp/eicar.com"
+  "echo 'WDVPIVAlQEFQWzRcUFpYNTQoUF4pN0NDKTd9JEVJQ0FSLVNUQU5EQVJELUFOVElWSVJVUy1URVNULUZJTEUhJEgrSCo=' | base64 -d > /tmp/eicar.com && chmod +x /tmp/eicar.com && /tmp/eicar.com"
 ```
 
-**Expected signal:** a malware alert if the sensor and anti-malware extension
-are healthy. EICAR is a harmless industry-standard test string, not malware.
+**Validation boundary:** EICAR is a harmless industry-standard test string, not
+malware. A nonzero container command does not by itself prove Defender blocked
+execution. Inspect the configured anti-malware action and Defender security
+alerts. Policy propagation can take up to 30 minutes, and subsequent alert
+delivery has variable latency.
 
 ### Test 3: Gated Deployment
 
-Attempts to deploy an image with known critical CVEs.
+Attempts Microsoft's test image shown in its gated-deployment troubleshooting
+documentation. This avoids assuming that an arbitrary old image tag still maps
+to current vulnerability findings.
 
 ```bash
-kubectl run vuln-test --image=nginx:1.14.0 --restart=Never
+kubectl run vuln-test --image=mcr.microsoft.com/mdc/dev/defender-admission-controller/test-images:one-high --restart=Never
 ```
 
-**Expected signal:** denial in an effective Deny policy or an audit
-recommendation in Audit mode. An old image tag does not guarantee that the
-current vulnerability feed will still classify it as a critical finding.
+**Validation boundary:** an effective matching Deny rule returns an admission-
+webhook denial; Audit allows the request. Review the authoritative decision,
+triggered rule, image digest, violations, and exemptions under Defender for
+Cloud > Environment settings > Security rules > Gated deployment > Admission
+Monitoring. An allowed pod can also mean a scope mismatch, missing findings
+artifacts, or incomplete prerequisites.
 
 ## Sentinel Analytics Rules
 
@@ -169,8 +193,11 @@ current vulnerability feed will still classify it as a critical finding.
 |---|---|---|---|
 | Binary Drift in Production Namespace | High | T1059 | SecurityAlert |
 | Container Malware Detected | High | T1204 | SecurityAlert |
-| Vulnerable Image Deployment Attempted | Medium | T1190 | SecurityAlert |
 | Suspicious kubectl exec into Container | Medium | T1609 | AzureDiagnostics |
+
+Gated-deployment events are intentionally absent from the Sentinel rules and
+workbook. Microsoft documents Admission Monitoring as their review surface and
+does not document a `SecurityAlert` `AlertType` named `GatedDeployment`.
 
 ## Estimated Cost
 
@@ -207,6 +234,8 @@ shared-setting drift fails closed before deletion.
 - [Microsoft: Binary drift detection](https://learn.microsoft.com/en-us/azure/defender-for-cloud/binary-drift-detection)
 - [Microsoft: Container runtime anti-malware](https://learn.microsoft.com/en-us/azure/defender-for-cloud/anti-malware)
 - [Microsoft: Kubernetes Gated Deployment](https://learn.microsoft.com/en-us/azure/defender-for-cloud/enablement-guide-runtime-gated)
+- [Microsoft: Troubleshoot Gated Deployment](https://learn.microsoft.com/en-us/azure/defender-for-cloud/troubleshooting-runtime-gated)
+- [Microsoft: Install the Defender sensor with Helm](https://learn.microsoft.com/en-us/azure/defender-for-cloud/deploy-helm)
 - [Microsoft: Defender for Cloud Attack Simulation](https://github.com/microsoft/Defender-for-Cloud-Attack-Simulation)
 - [MITRE ATT&CK: Containers Matrix](https://attack.mitre.org/matrices/enterprise/containers/)
 

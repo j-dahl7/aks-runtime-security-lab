@@ -8,7 +8,7 @@
     1. AKS cluster via Bicep (no Defender security profile)
     2. Defender for Containers plan enablement (with AntiMalware extension)
     3. Defender sensor via Helm chart (pinned 0.11.4 with anti-malware collector)
-    4. Sentinel analytics rules (4 scheduled rules)
+    4. Sentinel analytics rules (3 scheduled rules)
     5. Sentinel workbook (Container Runtime Security Dashboard)
 
     NOTE: Binary drift policy must be configured manually in the Azure portal
@@ -659,7 +659,7 @@ else {
     $desiredPricing = New-DesiredPricingProperties $currentPricingResource.properties
     $defenderPlanNeedsUpdate = (Get-PricingFingerprint $pricingBefore) -ne (Get-PricingFingerprint $desiredPricing)
     $ownerToken = [guid]::NewGuid().ToString('N')
-    $ruleSlugs = @('binary-drift-prod', 'container-malware', 'gated-deployment-block', 'kubectl-exec')
+    $ruleSlugs = @('binary-drift-prod', 'container-malware', 'kubectl-exec')
     $state = [ordered]@{
         version = 1
         projectName = $ProjectName
@@ -678,7 +678,7 @@ else {
 }
 
 if ($WhatIfPreference) {
-    $sentinelPreview = if ($SkipSentinel) { 'Skip Sentinel rules and workbook' } else { 'Preflight and deploy 4 owned Sentinel rules and 1 owned workbook' }
+    $sentinelPreview = if ($SkipSentinel) { 'Skip Sentinel rules and workbook' } else { 'Preflight and deploy 3 owned Sentinel rules and 1 owned workbook' }
     Write-Host "`n=== Deployment Preview Only ===" -ForegroundColor Yellow
     Write-Host @"
 
@@ -693,7 +693,7 @@ Planned changes:
   - $sentinelPreview
 
 Manual step after a real deployment:
-  Configure the binary drift policy in Defender for Cloud.
+  Configure the binary drift policy and a gated-deployment rule in Defender for Cloud.
 "@
     return
 }
@@ -1057,23 +1057,6 @@ union isfuzzy=true (datatable(TimeGenerated:datetime,AlertType:string,AlertName:
             techniques = @('T1204', 'T1105')
         },
         @{
-            slug     = 'gated-deployment-block'
-            name     = 'LAB - Vulnerable Image Deployment Attempted'
-            severity = 'Medium'
-            query    = @'
-union isfuzzy=true (datatable(TimeGenerated:datetime,AlertType:string,AlertName:string,ExtendedProperties:string,CompromisedEntity:string,AlertSeverity:string,Description:string)[]), (SecurityAlert)
-| where AlertType has "GatedDeployment" or AlertName has_any ("deployment was blocked", "vulnerable image")
-| extend ExtProps = parse_json(ExtendedProperties)
-| extend ImageName = coalesce(tostring(ExtProps["Image Name"]), tostring(ExtProps["ImageName"]), extract(@"[Ii]mage[:\s]+([^\s,]+)", 1, Description))
-| extend ClusterName = CompromisedEntity
-| extend VulnCount = coalesce(tostring(ExtProps["Vulnerability Count"]), extract(@"(\d+)\s+vulnerabilit", 1, Description))
-| where isnotempty(ImageName)
-| project TimeGenerated, AlertSeverity, ImageName, ClusterName, VulnCount, Description
-'@
-            tactics  = @('InitialAccess', 'Execution')
-            techniques = @('T1190', 'T1610')
-        },
-        @{
             slug     = 'kubectl-exec'
             name     = 'LAB - Suspicious kubectl exec into Container'
             severity = 'Medium'
@@ -1124,6 +1107,28 @@ AzureDiagnostics
         }
     }
 
+    # Revisions before August 13, 2026 created a gated-deployment rule by
+    # guessing at a SecurityAlert schema Microsoft does not document. Retire
+    # only the exact manifest-owned legacy rule; a missing resource is already
+    # the desired state, while any ownership mismatch fails closed.
+    $legacyGatedManifestRules = @($state.sentinelRules | Where-Object slug -eq 'gated-deployment-block')
+    if ($legacyGatedManifestRules.Count -gt 1) {
+        throw 'Ownership manifest contains multiple legacy gated-deployment rule IDs.'
+    }
+    $legacyGatedRule = $null
+    $legacyGatedRuleUrl = $null
+    if ($legacyGatedManifestRules.Count -eq 1) {
+        $legacyGatedRuleId = [string]$legacyGatedManifestRules[0].id
+        $legacyGatedRuleUrl = "$baseUrl/${legacyGatedRuleId}?api-version=$apiVersion"
+        $legacyGatedRule = Invoke-AzJson -Arguments @('rest', '--method', 'GET', '--url', $legacyGatedRuleUrl, '--only-show-errors', '--output', 'json') -NotFoundIsNull
+        if ($legacyGatedRule -and (
+            $legacyGatedRule.properties.displayName -ne 'LAB - Vulnerable Image Deployment Attempted' -or
+            $legacyGatedRule.properties.description -notmatch [regex]::Escape("[Owner: $ownerToken]")
+        )) {
+            throw "Refusing to delete legacy Sentinel rule '$legacyGatedRuleId': provenance does not match."
+        }
+    }
+
     $existingConnector = Invoke-AzJson -Arguments @('rest', '--method', 'GET', '--url', $connectorUrl, '--only-show-errors', '--output', 'json') -NotFoundIsNull
     if ($existingConnector -and (
         $existingConnector.kind -ne 'AzureSecurityCenter' -or
@@ -1158,6 +1163,21 @@ AzureDiagnostics
     })
     if ($workbookCollisions.Count -gt 0) {
         throw "Refusing to deploy workbook: another resource already uses '$workbookDisplayName'."
+    }
+
+    $legacyManifestCanBeRemoved = $legacyGatedManifestRules.Count -eq 1 -and -not $legacyGatedRule
+    if ($legacyGatedRule -and $PSCmdlet.ShouldProcess(
+        'LAB - Vulnerable Image Deployment Attempted',
+        'Delete exact owned legacy rule with undocumented gated-deployment alert schema'
+    )) {
+        az rest --method DELETE --url $legacyGatedRuleUrl --output none 2>$null
+        Assert-LastExitCode -Action 'Legacy gated-deployment Sentinel rule removal'
+        $legacyManifestCanBeRemoved = $true
+        Write-Host '  Deprecated gated-deployment Sentinel rule: Removed' -ForegroundColor Green
+    }
+    if ($legacyManifestCanBeRemoved) {
+        $state.sentinelRules = @($state.sentinelRules | Where-Object slug -ne 'gated-deployment-block')
+        Write-LabState -State $state
     }
 
     if (-not $existingConnector -and $PSCmdlet.ShouldProcess('Defender for Cloud data connector', 'Create exact compatible Sentinel data connector')) {
@@ -1227,10 +1247,10 @@ $sentinelSummary = if ($SkipSentinel) {
     'Skipped by request'
 }
 elseif ($EnableSentinelRules) {
-    '4 enabled owned analytics rules + 1 owned workbook'
+    '3 enabled owned analytics rules + 1 owned workbook'
 }
 else {
-    '4 disabled owned analytics rules + 1 owned workbook (review before enabling)'
+    '3 disabled owned analytics rules + 1 owned workbook (review before enabling)'
 }
 Write-Host "`n=== Deployment Complete ===" -ForegroundColor Green
 Write-Host @"
@@ -1248,8 +1268,12 @@ IMPORTANT - Manual step required:
   Change default from "Ignore drift detection" to "Drift detection alert"
   (No REST API exists for this setting)
 
+  Configure gated deployment under Environment Settings > Security rules.
+  Start in Audit, verify prerequisites and decisions in Admission Monitoring,
+  then use Deny only after validating the intended scope and thresholds.
+
 Next steps:
-  1. Configure drift policy (see above)
+  1. Configure drift and gated-deployment policies (see above)
 
   2. Verify Defender sensor:
      kubectl get pods -n mdc
@@ -1257,10 +1281,12 @@ Next steps:
   3. Run the test scenarios:
      ./scripts/Test-RuntimeSecurity.ps1
 
-  4. View alerts in Defender for Cloud:
+  4. View binary-drift and anti-malware alerts in Defender for Cloud:
      https://portal.azure.com/#view/Microsoft_Azure_Security/SecurityMenuBlade/~/SecurityAlerts
 
-  5. View Sentinel incidents:
+  5. Review gated-deployment decisions in Defender for Cloud Admission Monitoring.
+
+  6. View Sentinel incidents:
      https://security.microsoft.com/sentinel-incidents
 
 Cleanup:

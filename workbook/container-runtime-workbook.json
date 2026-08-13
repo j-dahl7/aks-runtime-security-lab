@@ -4,7 +4,7 @@
     {
       "type": 1,
       "content": {
-        "json": "# Container Runtime Security Dashboard\n\nMonitor binary drift, anti-malware, gated deployment alerts, and kubectl exec activity across AKS clusters."
+        "json": "# Container Runtime Security Dashboard\n\nMonitor binary drift and anti-malware alerts plus kubectl exec activity across AKS clusters. Review gated-deployment decisions in Defender for Cloud > Environment settings > Security rules > Gated deployment > Admission Monitoring; Microsoft does not document them as a SecurityAlert AlertType."
       },
       "name": "header"
     },
@@ -40,7 +40,7 @@
       "type": 3,
       "content": {
         "version": "KqlItem/1.0",
-        "query": "SecurityAlert\n| where TimeGenerated {TimeRange}\n| where ProductName == \"Microsoft Defender for Cloud\"\n| where AlertType has_any (\"DriftDetection\", \"BinaryDrift\", \"MalwareDetected\", \"GatedDeployment\", \"SuspectProcess\")\n| summarize Count = count() by bin(TimeGenerated, 1h), AlertType\n| render timechart",
+        "query": "SecurityAlert\n| where TimeGenerated {TimeRange}\n| where ProductName == \"Microsoft Defender for Cloud\"\n| where AlertType has_any (\"DriftDetection\", \"BinaryDrift\", \"MalwareDetected\", \"SuspectProcess\")\n| summarize Count = count() by bin(TimeGenerated, 1h), AlertType\n| render timechart",
         "size": 0,
         "title": "Runtime Alert Timeline",
         "queryType": 0,
