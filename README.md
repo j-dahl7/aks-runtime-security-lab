@@ -19,6 +19,17 @@ validation was performed for this revision. Feature availability, policy
 behavior, chart availability, and alert latency can vary by
 subscription, region, and cluster version.
 
+Run the offline deployment-safety harness from a fresh checkout:
+
+```powershell
+pwsh -NoProfile -File tests/Test-DeployLabSafety.ps1
+```
+
+It mocks Azure CLI, Kubernetes, and Helm to exercise ownership refusal, exact
+stale-resource cleanup, `-WhatIf`, pricing/profile rollback, readiness, and
+default-disabled/explicitly-enabled rules. It refuses to run over an existing
+ownership manifest. Passing this harness is not a live cluster or sensor test.
+
 ## Prerequisites
 
 - Azure subscription with **Owner** or **Contributor + User Access Administrator** role
@@ -133,6 +144,8 @@ before attributing an allow/deny result to a policy.
 ├── scripts/
 │   ├── Deploy-Lab.ps1              # One-command deployment
 │   └── Test-RuntimeSecurity.ps1    # 3 test scenarios
+├── tests/
+│   └── Test-DeployLabSafety.ps1    # Offline Azure/Kubernetes/Helm safety mocks
 └── workbook/
     └── container-runtime-workbook.json  # Container Runtime Security Dashboard
 ```
@@ -144,7 +157,7 @@ before attributing an allow/deny result to a policy.
 Drops and executes a script not present in the original container image.
 
 ```bash
-kubectl run drift-test --image=nginx:latest --restart=Never
+kubectl run drift-test --image=nginx:1.27-alpine --restart=Never
 kubectl exec drift-test -- /bin/sh -c \
   "echo '#!/bin/sh' > /tmp/notinimage.sh && chmod +x /tmp/notinimage.sh && /tmp/notinimage.sh"
 ```
@@ -159,7 +172,7 @@ a fixed window.
 Writes the [EICAR test file](https://www.eicar.org/download-anti-malware-testfile/), marks it executable, and attempts to execute it in a running container. Runtime anti-malware evaluates executable launch; writing the file alone is not the documented trigger.
 
 ```bash
-kubectl run malware-test --image=nginx:latest --restart=Never
+kubectl run malware-test --image=nginx:1.27-alpine --restart=Never
 kubectl exec malware-test -- /bin/sh -c \
   "echo 'WDVPIVAlQEFQWzRcUFpYNTQoUF4pN0NDKTd9JEVJQ0FSLVNUQU5EQVJELUFOVElWSVJVUy1URVNULUZJTEUhJEgrSCo=' | base64 -d > /tmp/eicar.com && chmod +x /tmp/eicar.com && /tmp/eicar.com"
 ```
