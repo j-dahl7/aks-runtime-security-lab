@@ -29,6 +29,8 @@ It mocks Azure CLI, Kubernetes, and Helm to exercise ownership refusal, exact
 stale-resource cleanup, `-WhatIf`, pricing/profile rollback, readiness, and
 default-disabled/explicitly-enabled rules. It refuses to run over an existing
 ownership manifest. Passing this harness is not a live cluster or sensor test.
+The separate `validate.yml` pull-request workflow compiles Bicep and runs these
+mocks without cloud credentials, deployment steps, or schedules.
 
 ## Prerequisites
 
