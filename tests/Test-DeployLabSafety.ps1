@@ -226,11 +226,17 @@ function global:az {
 
 function global:kubectl {
     $arguments = @($args | ForEach-Object { [string]$_ })
+    # The verified context deliberately differs from ProjectName; a subsequent
+    # default-context switch must not redirect any post-proof operation.
+    $capturingContext = $arguments[0] -eq 'config' -and $arguments[1] -eq 'current-context'
+    if (-not $capturingContext -and ($arguments[0] -ne '--context' -or $arguments[1] -ne 'verified-lab-context')) {
+        throw 'Kubernetes operation followed mutable current context instead of the captured identity context.'
+    }
     if ($arguments[0] -eq '--context') { $arguments = $arguments[2..($arguments.Count-1)] }
     Add-MockCall -Command ('kubectl ' + ($arguments -join ' ')) -Mutation:($arguments[0] -eq 'delete')
     $global:LASTEXITCODE = 0
     if ($arguments[0] -eq 'config') {
-        if ($arguments[1] -eq 'current-context') { return 'aks-runtime-lab' }
+        if ($arguments[1] -eq 'current-context') { return 'verified-lab-context' }
         if (($arguments -join ' ') -match 'certificate-authority-data') { return [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('mock-ca')) }
         if (($arguments -join ' ') -match 'insecure-skip-tls') { return 'false' }
         return 'https://owned.eastus.azmk8s.io:443'
@@ -260,6 +266,10 @@ function global:kubectl {
 
 function global:helm {
     $arguments = @($args | ForEach-Object { [string]$_ })
+    $contextIndex = [Array]::IndexOf($arguments, '--kube-context')
+    if ($contextIndex -lt 0 -or $arguments[$contextIndex + 1] -ne 'verified-lab-context') {
+        throw 'Helm operation followed mutable current context instead of the captured identity context.'
+    }
     Add-MockCall -Command ('helm ' + ($arguments -join ' ')) -Mutation:($arguments[0] -eq 'upgrade')
     $global:LASTEXITCODE = 0
     if ($arguments[0] -eq 'list') { return '[]' }

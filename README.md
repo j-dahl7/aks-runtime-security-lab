@@ -131,6 +131,8 @@ and recorded kube-system namespace UID before creating anything. A matching
 context alias alone is insufficient. A foreign namespace or foreign pod in the
 test namespace is refused. Every run creates uniquely named, owner-labeled pods;
 it never pre-deletes or replaces existing pods and verifies pod UID before exec.
+Deployment and cleanup Azure CLI calls use the captured subscription, and
+post-verification Kubernetes/Helm calls use the captured kubeconfig context.
 The output lists the run selector for review before manual cleanup. Use a
 dedicated lab and avoid concurrent kubeconfig, namespace, or pod administration
 during a run; Kubernetes exec does not expose an atomic UID precondition.

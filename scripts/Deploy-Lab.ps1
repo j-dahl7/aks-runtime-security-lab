@@ -487,6 +487,7 @@ function Get-ConflictingDefenderPolicyAssignments {
 }
 
 function Get-StaleDefenderClusterResources {
+    param([Parameter(Mandatory)][string]$Context)
     $resourceSelectors = @(
         @{ Kind = 'crd'; Name = 'policies.defender.microsoft.com' },
         @{ Kind = 'crd'; Name = 'policytemplates.defender.microsoft.com' },
@@ -500,7 +501,7 @@ function Get-StaleDefenderClusterResources {
 
     $existing = @()
     foreach ($selector in $resourceSelectors) {
-        $result = kubectl get $selector.Kind $selector.Name --ignore-not-found --output name 2>$null
+        $result = kubectl --context $Context get $selector.Kind $selector.Name --ignore-not-found --output name 2>$null
         Assert-LastExitCode -Action "Kubernetes preflight for $($selector.Kind)/$($selector.Name)"
         if (-not [string]::IsNullOrWhiteSpace(($result -join "`n"))) {
             $existing += $selector
@@ -839,7 +840,7 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Get AKS credentials")) {
     else { $state | Add-Member -NotePropertyName runtimeProof -NotePropertyValue $identity.proof -Force }
     Write-LabState -State $state
 
-    Write-Host "  kubectl context set to: $clusterName" -ForegroundColor Green
+    Write-Host "  Verified kubectl context: $($identity.context)" -ForegroundColor Green
 }
 
 # ---------- Deploy Defender Sensor via Helm ----------
@@ -885,7 +886,7 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
         throw ('Conflicting Defender auto-provision policy assignments found: {0}. Remove or exempt the lab scope before installing the Helm-managed sensor.' -f ($policySummary -join '; '))
     }
 
-    $helmReleaseJson = helm list --all --namespace mdc --output json
+    $helmReleaseJson = helm list --kube-context $identity.context --all --namespace mdc --output json
     Assert-LastExitCode -Action 'Existing Defender Helm release lookup'
     $helmReleases = if ([string]::IsNullOrWhiteSpace(($helmReleaseJson -join "`n"))) {
         @()
@@ -907,7 +908,7 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
         $_.name -eq $DefenderHelmReleaseName
     }).Count -gt 0
     $staleClusterResources = @(if (-not $currentReleaseExists) {
-        Get-StaleDefenderClusterResources
+        Get-StaleDefenderClusterResources -Context $identity.context
     })
     if ($staleClusterResources.Count -gt 0) {
         Write-Host "  Found $($staleClusterResources.Count) stale managed-sensor cluster resource(s); exact known resources will be removed before Helm." -ForegroundColor Yellow
@@ -985,12 +986,13 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
             Assert-LastExitCode -Action 'Applying the Defender Helm-management exclusion tag'
 
             foreach ($resource in $staleClusterResources) {
-                kubectl delete $resource.Kind $resource.Name --ignore-not-found 2>$null
+                kubectl --context $identity.context delete $resource.Kind $resource.Name --ignore-not-found 2>$null
                 Assert-LastExitCode -Action "Removing stale $($resource.Kind)/$($resource.Name)"
             }
 
             helm upgrade --install $DefenderHelmReleaseName `
                 $DefenderHelmChart `
+                --kube-context $identity.context `
                 --version $DefenderHelmChartVersion `
                 --namespace mdc `
                 --create-namespace `
@@ -1032,7 +1034,7 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
     $retries = 0
     $maxRetries = 12
     while ($retries -lt $maxRetries) {
-        $podJson = kubectl get pods -n mdc -o json 2>$null
+        $podJson = kubectl --context $identity.context get pods -n mdc -o json 2>$null
         Assert-LastExitCode -Action 'Defender sensor readiness lookup'
         $defenderPods = @((($podJson -join "`n") | ConvertFrom-Json).items | Where-Object {
             $_.metadata.name -match '(?i)(microsoft-defender|defender)'
