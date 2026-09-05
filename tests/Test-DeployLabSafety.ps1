@@ -76,6 +76,7 @@ function Reset-MockState {
     $global:AksMockGroupDeleteShouldFail = $false
     $global:AksMockPricingPutShouldFail = $false
     $global:AksMockGroupExistsShouldFail = $false
+    $global:AksMockCliSubscriptionId = $global:AksMockSubscriptionId
 }
 
 function Add-MockCall {
@@ -99,7 +100,15 @@ function global:az {
     $global:LASTEXITCODE = 0
 
     if ($arguments[0] -eq 'account' -and $arguments[1] -eq 'show') {
+        # Simulate another process changing CLI context immediately after capture.
+        # Every subsequent scoped command must use its explicit subscription.
+        $global:AksMockCliSubscriptionId = '99999999-9999-9999-9999-999999999999'
         return (@{ id = $global:AksMockSubscriptionId; tenantId = '11111111-1111-1111-1111-111111111111'; name = 'Mock Subscription' } | ConvertTo-Json -Compress)
+    }
+    if ($arguments[0] -ne 'rest') {
+        $subscriptionIndex = [Array]::IndexOf($arguments, '--subscription')
+        $targetSubscription = if ($subscriptionIndex -ge 0) { $arguments[$subscriptionIndex + 1] } else { $global:AksMockCliSubscriptionId }
+        if ($targetSubscription -ne $global:AksMockSubscriptionId) { throw "CLI context drift targeted a foreign subscription: $command" }
     }
     if ($arguments[0] -eq 'group' -and $arguments[1] -eq 'exists') {
         if ($global:AksMockGroupExistsShouldFail) { $global:LASTEXITCODE = 1; return 'authorization context not found' }

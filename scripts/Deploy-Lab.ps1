@@ -472,7 +472,7 @@ function Get-ConflictingDefenderPolicyAssignments {
     )
 
     foreach ($scopeArguments in $scopeArgumentSets) {
-        $json = az policy assignment list @scopeArguments --output json
+        $json = az policy assignment list @scopeArguments --subscription $SubscriptionId --output json
         Assert-LastExitCode -Action 'Defender auto-provision policy lookup'
         if (-not [string]::IsNullOrWhiteSpace(($json -join "`n"))) {
             $assignments += @(($json -join "`n") | ConvertFrom-Json)
@@ -512,6 +512,9 @@ function Get-StaleDefenderClusterResources {
 function Restore-ClusterProtectionState {
     param(
         [Parameter(Mandatory)]
+        [string]$SubscriptionId,
+
+        [Parameter(Mandatory)]
         [string]$ResourceGroupName,
 
         [Parameter(Mandatory)]
@@ -538,6 +541,7 @@ function Restore-ClusterProtectionState {
     if ($DefenderWasEnabled) {
         $enableArguments = @(
             'aks', 'update',
+            '--subscription', $SubscriptionId,
             '--resource-group', $ResourceGroupName,
             '--name', $ClusterName,
             '--enable-defender',
@@ -556,6 +560,7 @@ function Restore-ClusterProtectionState {
     if ($ExclusionTagExisted) {
         az tag update `
             --resource-id $ClusterId `
+            --subscription $SubscriptionId `
             --operation merge `
             --tags "${DefenderExclusionTag}=$ExclusionTagValue" `
             --output none
@@ -563,6 +568,7 @@ function Restore-ClusterProtectionState {
     else {
         az tag update `
             --resource-id $ClusterId `
+            --subscription $SubscriptionId `
             --operation delete `
             --tags $DefenderExclusionTag `
             --output none
@@ -771,6 +777,7 @@ $bicepPath = Join-Path $LabRoot 'bicep/main.bicep'
 
 if ($PSCmdlet.ShouldProcess("Subscription", "Deploy Bicep template")) {
     $deployment = az deployment sub create `
+        --subscription $subscriptionId `
         --location $Location `
         --template-file $bicepPath `
         --parameters projectName=$ProjectName location=$Location ownerToken=$ownerToken "apiServerAuthorizedIpRanges=$(ConvertTo-Json -InputObject @($ApiServerAuthorizedIpRanges) -Compress)" `
@@ -784,7 +791,7 @@ if ($PSCmdlet.ShouldProcess("Subscription", "Deploy Bicep template")) {
         throw 'The infrastructure deployment did not return the expected cluster and workspace outputs.'
     }
 
-    $ownedResourceGroup = Invoke-AzJson -Arguments @('group', 'show', '--name', $ResourceGroup, '--output', 'json')
+    $ownedResourceGroup = Get-LabResourceGroup
     if ([string]$ownedResourceGroup.tags.$OwnershipTagName -ne $ownerToken) {
         throw 'Resource group deployment did not preserve the manifest ownership token.'
     }
@@ -821,6 +828,7 @@ Write-Host "`n[4/7] Getting AKS credentials..." -ForegroundColor Yellow
 
 if ($PSCmdlet.ShouldProcess($clusterName, "Get AKS credentials")) {
     az aks get-credentials `
+        --subscription $subscriptionId `
         --resource-group $ResourceGroup `
         --name $clusterName `
         --overwrite-existing
@@ -840,6 +848,7 @@ Write-Host "`n[5/7] Deploying Defender sensor via Helm (with anti-malware)..." -
 if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
     $subscriptionId = $account.id
     $clusterJson = az aks show `
+        --subscription $subscriptionId `
         --resource-group $ResourceGroup `
         --name $clusterName `
         --output json
@@ -905,6 +914,7 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
     }
 
     $workspaceCustomerId = az monitor log-analytics workspace show `
+        --subscription $subscriptionId `
         --resource-group $ResourceGroup `
         --workspace-name $WorkspaceName `
         --query customerId `
@@ -913,6 +923,7 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
     $workspaceCustomerId = [string](($workspaceCustomerId | Select-Object -First 1)).Trim()
 
     $workspaceSharedKey = az monitor log-analytics workspace get-shared-keys `
+        --subscription $subscriptionId `
         --resource-group $ResourceGroup `
         --workspace-name $WorkspaceName `
         --query primarySharedKey `
@@ -957,6 +968,7 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
         try {
             # A Helm-managed sensor must not coexist with the AKS Defender profile.
             az aks update `
+                --subscription $subscriptionId `
                 --resource-group $ResourceGroup `
                 --name $clusterName `
                 --disable-defender `
@@ -965,6 +977,7 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
 
             # Exclude this cluster from automatic rediscovery while the sensor is Helm-managed.
             az tag update `
+                --subscription $subscriptionId `
                 --resource-id $clusterId `
                 --operation merge `
                 --tags "${DefenderExclusionTag}=true" `
@@ -992,6 +1005,7 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
             Write-Warning 'Defender Helm deployment failed. Restoring the cluster protection state captured before installation.'
             try {
                 Restore-ClusterProtectionState `
+                    -SubscriptionId $subscriptionId `
                     -ResourceGroupName $ResourceGroup `
                     -ClusterName $clusterName `
                     -ClusterId $clusterId `
@@ -1210,6 +1224,7 @@ AzureDiagnostics
     }
     $listedWorkbooks = @(Invoke-AzJson -Arguments @(
         'resource', 'list', '--resource-group', $ResourceGroup,
+        '--subscription', $subscriptionId,
         '--resource-type', 'Microsoft.Insights/workbooks', '--output', 'json'
     ))
     $workbookCollisions = @($listedWorkbooks | Where-Object {
