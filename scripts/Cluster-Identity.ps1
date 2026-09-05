@@ -1,3 +1,5 @@
+#Requires -Version 7.4
+
 # Shared read-only checks. No credentials or raw kubeconfig are persisted.
 function Invoke-LabJson {
     param([string]$Command, [string[]]$Arguments, [switch]$AllowEmpty)

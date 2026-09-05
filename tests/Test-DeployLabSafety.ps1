@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 7.4
 
 [CmdletBinding()]
 param()
@@ -117,6 +117,10 @@ function global:az {
         } | ConvertTo-Json -Compress)
     }
     if ($arguments[0] -eq 'group' -and $arguments[1] -eq 'delete') {
+        $subscriptionIndex = [Array]::IndexOf($arguments, '--subscription')
+        if ($subscriptionIndex -lt 0 -or $arguments[$subscriptionIndex + 1] -ne $global:AksMockSubscriptionId) {
+            throw 'Group deletion relied on mutable CLI context instead of the verified subscription.'
+        }
         if ($global:AksMockGroupDeleteShouldFail) { $global:LASTEXITCODE = 42; return 'simulated delete failure' }
         $global:AksMockResourceGroupExists = $false
         return

@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 7.4
 $ErrorActionPreference = 'Stop'
 # 1.1.1.1/32 is synthetic input for mocked Azure responses, never contacted.
 $root = Split-Path -Parent $PSScriptRoot

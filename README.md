@@ -39,7 +39,7 @@ mocks without cloud credentials, deployment steps, or schedules.
 - [kubectl](https://kubernetes.io/docs/tasks/tools/) compatible with the
   bundled AKS Kubernetes 1.35 deployment
 - [Helm](https://helm.sh/docs/intro/install/) v3.12+
-- [PowerShell 7](https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell)
+- [PowerShell 7.4 or later](https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell) (enforced before either entry point runs; required for the supported .NET APIs)
 
 This lab can enable or change the paid Defender for Containers plan and its
 extensions at subscription scope. If the required state is not already active,

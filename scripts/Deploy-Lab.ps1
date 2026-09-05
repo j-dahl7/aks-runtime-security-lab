@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 7.4
 
 <#
 .SYNOPSIS
@@ -642,7 +642,7 @@ if ($Destroy) {
 
     Write-Host "[!] Destroying exact manifest-owned lab resources..." -ForegroundColor Yellow
     if ($existingResourceGroup -and $PSCmdlet.ShouldProcess($resourceGroupId, 'Delete exact manifest-owned resource group')) {
-        az group delete --name $ResourceGroup --yes
+        az group delete --name $ResourceGroup --subscription $subscriptionId --yes
         Assert-LastExitCode -Action "Resource-group deletion for $ResourceGroup"
     }
     if (-not $WhatIfPreference) {
