@@ -1,4 +1,5 @@
 #Requires -Version 7.0
+
 <#
 .SYNOPSIS
     Runs test scenarios against the AKS Runtime Security Lab.
@@ -18,7 +19,7 @@
     Defaults to the same value Deploy-Lab.ps1 uses.
 
 .PARAMETER Namespace
-    Namespace the test pods are created in and deleted with. Created if absent.
+    Dedicated owner-labeled namespace. Foreign namespaces or pods are refused.
 
 .PARAMETER SkipDrift
     Skip the binary drift test.
@@ -36,7 +37,9 @@
 
 [CmdletBinding()]
 param(
+    [ValidatePattern('^[a-z0-9][a-z0-9-]{1,18}[a-z0-9]$')]
     [string]$ProjectName = 'aks-runtime-lab',
+    [ValidatePattern('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$')]
     [string]$Namespace = 'runtime-security-tests',
     [switch]$SkipDrift,
     [switch]$SkipMalware,
@@ -44,40 +47,78 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'Cluster-Identity.ps1')
 
 Write-Host "`n=== AKS Runtime Security Test Scenarios ===" -ForegroundColor Cyan
 Write-Host "These tests exercise configured controls; they do not guarantee alerts or fixed latency.`n"
 
-# ---------- Pre-flight ----------
-$context = kubectl config current-context 2>$null
-if (-not $context) {
-    throw "No kubectl context set. Run: az aks get-credentials --resource-group $ProjectName-rg --name $ProjectName"
+# ---------- Read-only ownership preflight ----------
+$statePath = Join-Path (Split-Path -Parent $PSScriptRoot) ".aks-runtime-lab-state-$ProjectName.json"
+$state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+if ($state.version -ne 1 -or $state.projectName -ne $ProjectName -or $state.ownerToken -notmatch '^[a-f0-9]{32}$' -or
+    -not $state.tenantId -or -not $state.runtimeProof) { throw 'A deployment manifest with recorded immutable cluster identity is required. Rerun the owned deployment.' }
+$account = Invoke-LabJson -Command az -Arguments @('account', 'show', '-o', 'json')
+$expectedRgId = "/subscriptions/$($account.id)/resourceGroups/$ProjectName-rg"
+if ($state.subscriptionId -ne $account.id -or $state.tenantId -ne $account.tenantId -or $state.resourceGroupId -ne $expectedRgId) { throw 'Active Azure account does not match deployment provenance.' }
+$group = Invoke-LabJson -Command az -Arguments @('group', 'show', '--name', "$ProjectName-rg", '--subscription', $account.id, '-o', 'json')
+if ($group.id -ne $state.resourceGroupId -or $group.tags.'nlzt-owner' -ne $state.ownerToken) { throw 'Live resource group is not owned by this deployment.' }
+$cluster = Invoke-LabJson -Command az -Arguments @('aks', 'show', '--resource-group', "$ProjectName-rg", '--name', $ProjectName, '--subscription', $account.id, '-o', 'json')
+$identity = Get-KubeClusterProof -State $state -Cluster $cluster
+$context = $identity.context
+$ownerToken = [string]$state.ownerToken
+$runId = [guid]::NewGuid().ToString('N')
+$createdPods = @{}
+$testNamespace = Invoke-LabJson -Command kubectl -Arguments @('--context', $context, 'get', 'namespace', $Namespace, '--ignore-not-found', '-o', 'json') -AllowEmpty
+if ($testNamespace -and $testNamespace.metadata.labels.'nlzt-owner' -ne $ownerToken) { throw 'Refusing a foreign test namespace.' }
+if ($testNamespace) {
+    $pods = Invoke-LabJson -Command kubectl -Arguments @('--context', $context, 'get', 'pods', '-n', $Namespace, '-o', 'json')
+    if ($null -eq $pods.items -or @($pods.items | Where-Object { $_.metadata.labels.'nlzt-owner' -ne $ownerToken }).Count) { throw 'Test namespace contains foreign pods or an unreadable inventory.' }
 }
-if ($context -ne $ProjectName) {
-    throw @"
-Refusing to run. The current kubectl context is '$context', not the lab cluster '$ProjectName'.
-These tests execute a dropped binary and write and execute the EICAR test file inside a
-running container, so they must never touch a cluster that is not the lab. Either switch context
-with 'az aks get-credentials --resource-group $ProjectName-rg --name $ProjectName', or pass
--ProjectName if your lab cluster genuinely has a different name.
-"@
+else {
+    $namespaceJson = @{apiVersion='v1';kind='Namespace';metadata=@{name=$Namespace;labels=@{'nlzt-owner'=$ownerToken}}} | ConvertTo-Json -Depth 6 -Compress
+    $created = $namespaceJson | kubectl --context $context create -f - -o json
+    if ($LASTEXITCODE -ne 0) { throw 'Namespace create failed; existing namespaces are never adopted or overwritten.' }
+    $testNamespace = ($created | Out-String) | ConvertFrom-Json
 }
-Write-Host "kubectl context: $context"
+if (-not $testNamespace.metadata.uid -or $testNamespace.metadata.labels.'nlzt-owner' -ne $ownerToken) { throw 'Namespace creation did not return the expected ownership.' }
+$namespaceUid = [string]$testNamespace.metadata.uid
 
-kubectl create namespace $Namespace --dry-run=client -o yaml | kubectl apply -f - | Out-Null
-Write-Host "test namespace: $Namespace`n"
+function Assert-OwnedTestNamespace {
+    $currentNamespace = Invoke-LabJson -Command kubectl -Arguments @('--context', $context, 'get', 'namespace', $Namespace, '-o', 'json')
+    if ($currentNamespace.metadata.uid -ne $namespaceUid -or $currentNamespace.metadata.labels.'nlzt-owner' -ne $ownerToken) { throw 'Test namespace identity changed; refusing mutation.' }
+}
+function Assert-OwnedTestPod {
+    param([string]$Name)
+    Assert-OwnedTestNamespace
+    $pod = Invoke-LabJson -Command kubectl -Arguments @('--context', $context, 'get', 'pod', $Name, '-n', $Namespace, '-o', 'json')
+    if (-not $createdPods[$Name] -or $pod.metadata.uid -ne $createdPods[$Name] -or
+        $pod.metadata.labels.'nlzt-owner' -ne $ownerToken -or $pod.metadata.labels.'nlzt-run' -ne $runId) { throw 'Test pod or namespace identity changed; refusing execution.' }
+}
+function New-OwnedTestPod {
+    param([string]$Name, [string]$Image)
+    Assert-OwnedTestNamespace
+    $output = kubectl --context $context run $Name -n $Namespace --image=$Image --restart=Never --labels="nlzt-owner=$ownerToken,nlzt-run=$runId" -o json
+    if ($LASTEXITCODE -ne 0) { throw 'Pod create failed; existing pods are never deleted or replaced.' }
+    $pod = ($output | Out-String) | ConvertFrom-Json
+    if ($pod.metadata.name -ne $Name -or -not $pod.metadata.uid -or $pod.metadata.labels.'nlzt-owner' -ne $ownerToken -or $pod.metadata.labels.'nlzt-run' -ne $runId) { throw 'Pod create returned unexpected ownership.' }
+    $createdPods[$Name] = [string]$pod.metadata.uid
+    Assert-OwnedTestPod $Name
+    kubectl --context $context wait -n $Namespace --for=condition=Ready "pod/$Name" --timeout=120s
+    if ($LASTEXITCODE -ne 0) { throw 'Owned test pod did not become ready; execution was not attempted.' }
+}
+Write-Host "Verified immutable cluster identity; test namespace: $Namespace; run: $runId`n"
 
 # ---------- Test 1: Binary Drift ----------
 if (-not $SkipDrift) {
     Write-Host "[Test 1/3] Binary Drift Detection" -ForegroundColor Yellow
     Write-Host "  Deploying clean nginx container..."
 
-    kubectl delete pod drift-test -n $Namespace --ignore-not-found=true --wait=true 2>$null
-    kubectl run drift-test -n $Namespace --image=nginx:1.27-alpine --restart=Never --labels="test=drift" 2>$null
-    kubectl wait -n $Namespace --for=condition=Ready pod/drift-test --timeout=120s
+    $driftPod = "drift-test-$runId"
+    New-OwnedTestPod $driftPod 'nginx:1.27-alpine'
 
     Write-Host "  Introducing binary drift (creating + executing script not in image)..."
-    kubectl exec drift-test -n $Namespace -- /bin/sh -c @"
+    Assert-OwnedTestPod $driftPod
+    kubectl --context $context exec $driftPod -n $Namespace -- /bin/sh -c @"
 cat > /tmp/drift-binary.sh << 'SCRIPT'
 #!/bin/sh
 echo 'This binary is not part of the original image'
@@ -87,6 +128,7 @@ SCRIPT
 chmod +x /tmp/drift-binary.sh
 /tmp/drift-binary.sh
 "@
+    if ($LASTEXITCODE -ne 0) { throw 'Binary drift command failed; review the actual control evidence.' }
 
     Write-Host "  Binary drift activity submitted." -ForegroundColor Green
     Write-Host "  Review the configured drift action and Defender security alerts."
@@ -98,24 +140,26 @@ if (-not $SkipMalware) {
     Write-Host "[Test 2/3] Container Anti-Malware (EICAR)" -ForegroundColor Yellow
     Write-Host "  Deploying clean nginx container..."
 
-    kubectl delete pod malware-test -n $Namespace --ignore-not-found=true --wait=true 2>$null
-    kubectl run malware-test -n $Namespace --image=nginx:1.27-alpine --restart=Never --labels="test=malware" 2>$null
-    kubectl wait -n $Namespace --for=condition=Ready pod/malware-test --timeout=120s
+    $malwarePod = "malware-test-$runId"
+    New-OwnedTestPod $malwarePod 'nginx:1.27-alpine'
 
     Write-Host "  Writing EICAR test file into container..."
     # EICAR test string (base64-encoded to avoid shell escaping issues)
     # This is NOT malware, it's the standard 68-byte AV test file
-    kubectl exec malware-test -n $Namespace -- /bin/sh -c "echo 'WDVPIVAlQEFQWzRcUFpYNTQoUF4pN0NDKTd9JEVJQ0FSLVNUQU5EQVJELUFOVElWSVJVUy1URVNULUZJTEUhJEgrSCo=' | base64 -d > /tmp/eicar.com"
+    Assert-OwnedTestPod $malwarePod
+    kubectl --context $context exec $malwarePod -n $Namespace -- /bin/sh -c "echo 'WDVPIVAlQEFQWzRcUFpYNTQoUF4pN0NDKTd9JEVJQ0FSLVNUQU5EQVJELUFOVElWSVJVUy1URVNULUZJTEUhJEgrSCo=' | base64 -d > /tmp/eicar.com"
     if ($LASTEXITCODE -ne 0) {
         throw 'Writing the EICAR test file failed; the execution stage was not attempted.'
     }
 
     Write-Host "  Marking the file executable and attempting execution..."
-    kubectl exec malware-test -n $Namespace -- /bin/sh -c "chmod +x /tmp/eicar.com"
+    Assert-OwnedTestPod $malwarePod
+    kubectl --context $context exec $malwarePod -n $Namespace -- /bin/sh -c "chmod +x /tmp/eicar.com"
     if ($LASTEXITCODE -ne 0) {
         throw 'Making the EICAR test file executable failed; the execution stage was not attempted.'
     }
-    $malwareResult = kubectl exec malware-test -n $Namespace -- /bin/sh -c "/tmp/eicar.com" 2>&1
+    Assert-OwnedTestPod $malwarePod
+    $malwareResult = kubectl --context $context exec $malwarePod -n $Namespace -- /bin/sh -c "/tmp/eicar.com" 2>&1
     $malwareExitCode = $LASTEXITCODE
     Write-Host "  EICAR execution was attempted (container command exit $malwareExitCode)." -ForegroundColor Green
     Write-Host "  Runtime anti-malware evaluates execution, not the file write alone."
@@ -131,11 +175,12 @@ if (-not $SkipGated) {
     Write-Host "  Attempting Microsoft's documented gated-deployment test image:"
     Write-Host "  $gatedTestImage"
 
-    kubectl delete pod vuln-test -n $Namespace --ignore-not-found=true --wait=true 2>$null
+    $gatedPod = "vuln-test-$runId"
 
     # Deny mode returns an admission-webhook error. Audit mode allows the pod and
     # records the decision in Defender for Cloud Admission Monitoring.
-    $result = kubectl run vuln-test -n $Namespace --image=$gatedTestImage --restart=Never --labels="test=gated" 2>&1
+    Assert-OwnedTestNamespace
+    $result = kubectl --context $context run $gatedPod -n $Namespace --image=$gatedTestImage --restart=Never --labels="nlzt-owner=$ownerToken,nlzt-run=$runId" 2>&1
     $gatedExitCode = $LASTEXITCODE
 
     if ($gatedExitCode -ne 0 -and $result -match "admission webhook|denied|Forbidden|blocked") {
@@ -180,6 +225,8 @@ Selected scenarios were attempted. Review each control in its documented surface
      | project TimeGenerated, AlertName, AlertSeverity, Description
 
 Cleanup test pods:
-  kubectl delete pod drift-test malware-test vuln-test -n $Namespace --ignore-not-found
+  Review this run's pods before manual cleanup:
+  kubectl --context $context get pods -n $Namespace -l nlzt-owner=$ownerToken,nlzt-run=$runId
+  No existing pods were deleted or replaced by this helper.
 
 "@

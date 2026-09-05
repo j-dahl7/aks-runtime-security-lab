@@ -62,7 +62,6 @@ AzureDiagnostics
 | extend Username = tostring(RequestObject.user.username)
 | where Verb in ("create", "get")
 | where RequestURI has "/exec"
-| where RequestURI !has "kube-system"
 | extend PodName = extract(@"/pods/([^/]+)/exec", 1, RequestURI)
 | extend Namespace = extract(@"namespaces/([^/]+)/", 1, RequestURI)
 | project TimeGenerated, Username, SourceIP,

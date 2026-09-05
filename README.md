@@ -75,7 +75,8 @@ cd aks-runtime-security-lab
 ```powershell
 # Read-only preview. This reports intended operations and performs no Azure,
 # Kubernetes, Helm, kubeconfig, or local secret-file mutations.
-./scripts/Deploy-Lab.ps1 -Location "eastus" -ProjectName "aks-runtime-lab" -WhatIf
+$operatorEgress = @('<your-public-egress-ip>/32') # Replace; do not use a sample IP.
+./scripts/Deploy-Lab.ps1 -Location "eastus" -ProjectName "aks-runtime-lab" -ApiServerAuthorizedIpRanges $operatorEgress -WhatIf
 ```
 
 Verify the active subscription and current shared plan before the real run:
@@ -89,7 +90,7 @@ az security pricing show --name Containers -o json
 $env:CONFIRM_SUBSCRIPTION_SCOPE = 'ENABLE-DEFENDER-FOR-CONTAINERS'
 
 # Live deployment: AKS + Defender + Helm sensor + disabled Sentinel rules + workbook
-./scripts/Deploy-Lab.ps1 -Location "eastus" -ProjectName "aks-runtime-lab"
+./scripts/Deploy-Lab.ps1 -Location "eastus" -ProjectName "aks-runtime-lab" -ApiServerAuthorizedIpRanges $operatorEgress
 
 # After reviewing the queries, explicitly enable the three rules.
 ./scripts/Deploy-Lab.ps1 -Location "eastus" -ProjectName "aks-runtime-lab" -EnableSentinelRules
@@ -102,16 +103,41 @@ workspace key. The script removes that file after success or failure, uses
 Helm `--atomic`, and attempts to restore the prior cluster Defender/profile-tag
 state if the chart deployment fails.
 
-After verifying that `kubectl config current-context` is the dedicated lab
-cluster, run the harmless test scenarios:
+First deployment requires 1-20 explicit public operator-egress IPv4 CIDRs, each
+/24 through /32; broad, private, malformed, noncanonical, or duplicate ranges
+are rejected. Obtain the correct VPN/NAT egress from your network owner; the
+script does not discover it or silently allow every address. Owned reruns reuse
+the exact saved ranges when omitted and refuse changed inputs or live range
+drift. See [Microsoft's authorized IP range guidance](https://learn.microsoft.com/en-us/azure/aks/api-server-authorized-ip-ranges),
+including connectivity propagation and egress requirements. The API endpoint
+remains public behind that IP allowlist, and this lab retains its existing local
+Kubernetes authentication. It is not a private or Entra-only cluster deployment.
+
+Run the test scenarios after the ownership-verified deployment:
 
 ```powershell
 ./scripts/Test-RuntimeSecurity.ps1 -ProjectName "aks-runtime-lab" -Namespace "runtime-security-tests"
 ```
 
-Deployment parameters are `-Location`, `-ProjectName`, `-SkipSentinel`,
+Deployment parameters are `-Location`, `-ProjectName`, `-ApiServerAuthorizedIpRanges`, `-SkipSentinel`,
 `-EnableSentinelRules`, `-Destroy`, and PowerShell's common `-WhatIf` switch. The test helper accepts
 `-ProjectName`, `-Namespace`, `-SkipDrift`, `-SkipMalware`, and `-SkipGated`.
+
+The test helper verifies the active tenant/subscription, resource-group owner,
+ARM resource ID and immutable resourceUID, API allowlist, kubeconfig server/CA,
+and recorded kube-system namespace UID before creating anything. A matching
+context alias alone is insufficient. A foreign namespace or foreign pod in the
+test namespace is refused. Every run creates uniquely named, owner-labeled pods;
+it never pre-deletes or replaces existing pods and verifies pod UID before exec.
+The output lists the run selector for review before manual cleanup. Use a
+dedicated lab and avoid concurrent kubeconfig, namespace, or pod administration
+during a run; Kubernetes exec does not expose an atomic UID precondition.
+
+Legacy manifests must be refreshed by an owned deployment with explicit API
+ranges before runtime testing. Existing recorded identity mismatches (including
+certificate rotation or cluster recreation) fail closed and require independent
+operator verification; deleting the ownership manifest is not a recovery step.
+The local manifest is trusted operator state, not a tamper-proof attestation.
 
 > **Portal steps required before testing:** Configure the **binary drift policy** in Defender for Cloud > Environment Settings > Containers drift policy. The default is "Ignore drift detection"; change it to "Drift detection alert" or "Drift detection blocking". Review the anti-malware rules and chosen Alert/Block action; Microsoft says policy changes can take up to 30 minutes to reach sensors. Then create a gated-deployment vulnerability-assessment rule under Environment Settings > Security Rules. Start with **Audit**, validate its decisions in **Gated deployment > Admission Monitoring**, and move to **Deny** only when the intended scope and thresholds are correct. The deployment script does not create these policies.
 
@@ -158,10 +184,8 @@ before attributing an allow/deny result to a policy.
 
 Drops and executes a script not present in the original container image.
 
-```bash
-kubectl run drift-test --image=nginx:1.27-alpine --restart=Never
-kubectl exec drift-test -- /bin/sh -c \
-  "echo '#!/bin/sh' > /tmp/notinimage.sh && chmod +x /tmp/notinimage.sh && /tmp/notinimage.sh"
+```powershell
+./scripts/Test-RuntimeSecurity.ps1 -SkipMalware -SkipGated
 ```
 
 **Validation boundary:** the activity should be evaluated when binary drift is
@@ -173,10 +197,8 @@ a fixed window.
 
 Writes the [EICAR test file](https://www.eicar.org/download-anti-malware-testfile/), marks it executable, and attempts to execute it in a running container. Runtime anti-malware evaluates executable launch; writing the file alone is not the documented trigger.
 
-```bash
-kubectl run malware-test --image=nginx:1.27-alpine --restart=Never
-kubectl exec malware-test -- /bin/sh -c \
-  "echo 'WDVPIVAlQEFQWzRcUFpYNTQoUF4pN0NDKTd9JEVJQ0FSLVNUQU5EQVJELUFOVElWSVJVUy1URVNULUZJTEUhJEgrSCo=' | base64 -d > /tmp/eicar.com && chmod +x /tmp/eicar.com && /tmp/eicar.com"
+```powershell
+./scripts/Test-RuntimeSecurity.ps1 -SkipDrift -SkipGated
 ```
 
 **Validation boundary:** EICAR is a harmless industry-standard test string, not
@@ -191,8 +213,8 @@ Attempts Microsoft's test image shown in its gated-deployment troubleshooting
 documentation. This avoids assuming that an arbitrary old image tag still maps
 to current vulnerability findings.
 
-```bash
-kubectl run vuln-test --image=mcr.microsoft.com/mdc/dev/defender-admission-controller/test-images:one-high --restart=Never
+```powershell
+./scripts/Test-RuntimeSecurity.ps1 -SkipDrift -SkipMalware
 ```
 
 **Validation boundary:** an effective matching Deny rule returns an admission-
@@ -209,6 +231,10 @@ artifacts, or incomplete prerequisites.
 | Binary Drift in Production Namespace | High | T1059 | SecurityAlert |
 | Container Malware Detected | High | T1204 | SecurityAlert |
 | Suspicious kubectl exec into Container | Medium | T1609 | AzureDiagnostics |
+
+The exec rule includes `kube-system`; a namespace name does not establish a
+trusted caller. Tune specific authenticated automation identities only after
+reviewing their actual activity, rather than excluding the entire namespace.
 
 Gated-deployment events are intentionally absent from the Sentinel rules and
 workbook. Microsoft documents Admission Monitoring as their review surface and
@@ -238,11 +264,14 @@ manifest before the first cloud write. A pre-existing resource group is never
 adopted without that manifest and its per-deployment ownership token.
 
 `-Destroy -WhatIf` previews exact cleanup. The real cleanup validates the
-manifest and resource-group ownership tag, restores the captured pre-lab
-Defender for Containers pricing/extensions only when the current shared state
-still exactly matches what this lab wrote, deletes the exact owned resource
-group, verifies deletion, and then removes the manifest. Any ownership or
-shared-setting drift fails closed before deletion.
+manifest and resource-group ownership tag, preflights shared pricing, deletes
+the exact owned group, and verifies its absence before restoring captured
+pre-lab Defender pricing/extensions. A failed or incomplete group deletion keeps
+the current protection and retry manifest. Pricing restore is rechecked for
+concurrent changes and verified before the manifest is removed. A retry accepts
+the exact already-restored before-state, so a failed restore or interrupted
+final manifest removal can be completed without another group deletion. Other
+shared-setting drift fails closed; it is never overwritten.
 
 ## Resources
 
