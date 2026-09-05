@@ -1,5 +1,6 @@
 #Requires -Version 7.0
 $ErrorActionPreference = 'Stop'
+# 1.1.1.1/32 is synthetic input for mocked Azure responses, never contacted.
 $root = Split-Path -Parent $PSScriptRoot
 $statePath = Join-Path $root '.aks-runtime-lab-state-aks-runtime-lab.json'
 if (Test-Path -LiteralPath $statePath) { throw 'Use a fresh checkout without an ownership manifest for mocked tests.' }
@@ -11,13 +12,13 @@ $server = 'https://owned.eastus.azmk8s.io:443'
 $ca = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('mock-ca'))
 $caHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Convert]::FromBase64String($ca)))
 $state = @{version=1;projectName='aks-runtime-lab';ownerToken=$owner;subscriptionId=$sub;tenantId=$tenant;resourceGroupId=$rg;
-    apiServerAuthorizedIpRanges=@('203.0.113.10/32'); runtimeProof=@{clusterResourceId="$rg/providers/Microsoft.ContainerService/managedClusters/aks-runtime-lab";clusterResourceUid='immutable-arm-id';server=$server;caSha256=$caHash;kubeSystemUid='immutable-kube-id'}}
+    apiServerAuthorizedIpRanges=@('1.1.1.1/32'); runtimeProof=@{clusterResourceId="$rg/providers/Microsoft.ContainerService/managedClusters/aks-runtime-lab";clusterResourceUid='immutable-arm-id';server=$server;caSha256=$caHash;kubeSystemUid='immutable-kube-id'}}
 function global:az {
     $global:LASTEXITCODE=0
     $a=@($args)
     if ($a[0] -eq 'account') { return (@{id=$sub;tenantId=$(if($global:AksRuntimeCase -eq 'tenant'){'foreign'}else{$tenant})}|ConvertTo-Json -Compress) }
     if ($a[0] -eq 'group') { return (@{id=$rg;tags=@{'nlzt-owner'=$owner}}|ConvertTo-Json -Compress) }
-    if ($a[0] -eq 'aks') { return (@{id=$state.runtimeProof.clusterResourceId;resourceUid=$(if($global:AksRuntimeCase -eq 'arm-uid'){'recreated'}else{'immutable-arm-id'});fqdn='owned.eastus.azmk8s.io';apiServerAccessProfile=@{authorizedIpRanges=@($(if($global:AksRuntimeCase -eq 'network-drift'){'0.0.0.0/0'}else{'203.0.113.10/32'}))}}|ConvertTo-Json -Depth 8 -Compress) }
+    if ($a[0] -eq 'aks') { return (@{id=$state.runtimeProof.clusterResourceId;resourceUid=$(if($global:AksRuntimeCase -eq 'arm-uid'){'recreated'}else{'immutable-arm-id'});fqdn='owned.eastus.azmk8s.io';apiServerAccessProfile=@{authorizedIpRanges=@($(if($global:AksRuntimeCase -eq 'network-drift'){'0.0.0.0/0'}else{'1.1.1.1/32'}))}}|ConvertTo-Json -Depth 8 -Compress) }
     throw "Unexpected Azure command $a"
 }
 function global:kubectl {

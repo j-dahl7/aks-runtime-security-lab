@@ -104,8 +104,10 @@ Helm `--atomic`, and attempts to restore the prior cluster Defender/profile-tag
 state if the chart deployment fails.
 
 First deployment requires 1-20 explicit public operator-egress IPv4 CIDRs, each
-/24 through /32; broad, private, malformed, noncanonical, or duplicate ranges
-are rejected. Obtain the correct VPN/NAT egress from your network owner; the
+/24 through /32; broad, private, documentation, benchmark, protocol-assignment,
+deprecated-relay, malformed, noncanonical, or duplicate ranges are rejected.
+This input validation cannot prove an address is your actual egress.
+Obtain the correct VPN/NAT egress from your network owner; the
 script does not discover it or silently allow every address. Owned reruns reuse
 the exact saved ranges when omitted and refuse changed inputs or live range
 drift. See [Microsoft's authorized IP range guidance](https://learn.microsoft.com/en-us/azure/aks/api-server-authorized-ip-ranges),

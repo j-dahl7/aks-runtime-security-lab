@@ -23,6 +23,12 @@ function Assert-ApiServerRanges {
             ($bytes[0] -eq 172 -and $bytes[1] -ge 16 -and $bytes[1] -le 31) -or
             ($bytes[0] -eq 192 -and $bytes[1] -eq 168) -or
             ($bytes[0] -eq 100 -and $bytes[1] -ge 64 -and $bytes[1] -le 127) -or
+            # Protocol assignments, documentation, deprecated relay, and benchmark ranges.
+            ($bytes[0] -eq 192 -and $bytes[1] -eq 0 -and $bytes[2] -in @(0,2)) -or
+            ($bytes[0] -eq 192 -and $bytes[1] -eq 88 -and $bytes[2] -eq 99) -or
+            ($bytes[0] -eq 198 -and $bytes[1] -eq 51 -and $bytes[2] -eq 100) -or
+            ($bytes[0] -eq 203 -and $bytes[1] -eq 0 -and $bytes[2] -eq 113) -or
+            ($bytes[0] -eq 198 -and $bytes[1] -in @(18,19)) -or
             ($bytes[3] % [math]::Pow(2, 32-$prefix)) -ne 0) { throw "Use a public, canonical operator-egress IPv4 CIDR: $range" }
     }
     if (@($Ranges | Sort-Object -Unique).Count -ne $Ranges.Count) { throw 'API server authorized ranges contain duplicates.' }
