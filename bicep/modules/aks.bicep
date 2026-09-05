@@ -5,6 +5,7 @@
 param projectName string
 param location string
 param kubernetesVersion string
+param apiServerAuthorizedIpRanges array
 param nodeVmSize string
 param nodeCount int
 param logAnalyticsWorkspaceId string
@@ -24,6 +25,10 @@ resource aks 'Microsoft.ContainerService/managedClusters@2024-09-01' = {
     kubernetesVersion: kubernetesVersion
     dnsPrefix: projectName
     enableRBAC: true
+    apiServerAccessProfile: {
+      enablePrivateCluster: false
+      authorizedIPRanges: apiServerAuthorizedIpRanges
+    }
 
     agentPoolProfiles: [
       {

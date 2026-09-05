@@ -34,4 +34,6 @@ jobs:
 
       - name: Run offline ownership and rollback mocks
         shell: pwsh
-        run: ./tests/Test-DeployLabSafety.ps1
+        run: |
+          ./tests/Test-DeployLabSafety.ps1
+          ./tests/Test-RuntimeSafety.ps1

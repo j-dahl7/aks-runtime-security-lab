@@ -2,7 +2,7 @@
 // Deploys AKS cluster with Defender for Containers, Log Analytics, and Container Insights
 //
 // Supported entry point from the repository root:
-//   ./scripts/Deploy-Lab.ps1 -Location eastus -WhatIf
+//   ./scripts/Deploy-Lab.ps1 -Location eastus -ApiServerAuthorizedIpRanges '<your-public-egress-ip>/32' -WhatIf
 // Use that ownership-aware orchestrator for deployment; it supplies the secure
 // ownerToken and records the rollback manifest. Direct Bicep deployment is unsupported.
 //
@@ -29,6 +29,11 @@ param nodeCount int = 1
 
 @description('Kubernetes version')
 param kubernetesVersion string = '1.35'
+
+@description('Explicit operator egress IPv4 CIDRs for the public API server; validated by Deploy-Lab.ps1')
+@minLength(1)
+@maxLength(20)
+param apiServerAuthorizedIpRanges array
 
 @description('Additional tags for all resources')
 param tags object = {}
@@ -70,6 +75,7 @@ module aks 'modules/aks.bicep' = {
     projectName: projectName
     location: location
     kubernetesVersion: kubernetesVersion
+    apiServerAuthorizedIpRanges: apiServerAuthorizedIpRanges
     nodeVmSize: nodeVmSize
     nodeCount: nodeCount
     logAnalyticsWorkspaceId: monitoring.outputs.workspaceId

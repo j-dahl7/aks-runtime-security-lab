@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 7.4
 
 [CmdletBinding()]
 param()
@@ -19,6 +19,7 @@ $global:AksMockWorkspaceResourceId = "$global:AksMockResourceGroupId/providers/M
 $global:AksMockWorkspaceCustomerId = '11111111-1111-1111-1111-111111111111'
 $global:AksMockWorkspaceKey = 'TEST-ONLY-NOT-A-REAL-WORKSPACE-KEY'
 $OriginalSubscriptionConfirmation = $env:CONFIRM_SUBSCRIPTION_SCOPE
+# 1.1.1.1/32 is synthetic input for mocked Azure responses, never contacted.
 
 function Assert-Condition {
     param([Parameter(Mandatory)][bool]$Condition, [Parameter(Mandatory)][string]$Message)
@@ -72,6 +73,10 @@ function Reset-MockState {
     $global:AksMockValuesDirectory = $null
     $global:AksMockPricingProperties = New-MockPricingProperties -Configured $PricingConfigured
     $global:AksMockPolicyTemplateExists = $false
+    $global:AksMockGroupDeleteShouldFail = $false
+    $global:AksMockPricingPutShouldFail = $false
+    $global:AksMockGroupExistsShouldFail = $false
+    $global:AksMockCliSubscriptionId = $global:AksMockSubscriptionId
 }
 
 function Add-MockCall {
@@ -95,7 +100,19 @@ function global:az {
     $global:LASTEXITCODE = 0
 
     if ($arguments[0] -eq 'account' -and $arguments[1] -eq 'show') {
-        return (@{ id = $global:AksMockSubscriptionId; name = 'Mock Subscription' } | ConvertTo-Json -Compress)
+        # Simulate another process changing CLI context immediately after capture.
+        # Every subsequent scoped command must use its explicit subscription.
+        $global:AksMockCliSubscriptionId = '99999999-9999-9999-9999-999999999999'
+        return (@{ id = $global:AksMockSubscriptionId; tenantId = '11111111-1111-1111-1111-111111111111'; name = 'Mock Subscription' } | ConvertTo-Json -Compress)
+    }
+    if ($arguments[0] -ne 'rest') {
+        $subscriptionIndex = [Array]::IndexOf($arguments, '--subscription')
+        $targetSubscription = if ($subscriptionIndex -ge 0) { $arguments[$subscriptionIndex + 1] } else { $global:AksMockCliSubscriptionId }
+        if ($targetSubscription -ne $global:AksMockSubscriptionId) { throw "CLI context drift targeted a foreign subscription: $command" }
+    }
+    if ($arguments[0] -eq 'group' -and $arguments[1] -eq 'exists') {
+        if ($global:AksMockGroupExistsShouldFail) { $global:LASTEXITCODE = 1; return 'authorization context not found' }
+        return ($global:AksMockResourceGroupExists | ConvertTo-Json -Compress)
     }
     if ($arguments[0] -eq 'group' -and $arguments[1] -eq 'show') {
         if (-not $global:AksMockResourceGroupExists) {
@@ -109,6 +126,11 @@ function global:az {
         } | ConvertTo-Json -Compress)
     }
     if ($arguments[0] -eq 'group' -and $arguments[1] -eq 'delete') {
+        $subscriptionIndex = [Array]::IndexOf($arguments, '--subscription')
+        if ($subscriptionIndex -lt 0 -or $arguments[$subscriptionIndex + 1] -ne $global:AksMockSubscriptionId) {
+            throw 'Group deletion relied on mutable CLI context instead of the verified subscription.'
+        }
+        if ($global:AksMockGroupDeleteShouldFail) { $global:LASTEXITCODE = 42; return 'simulated delete failure' }
         $global:AksMockResourceGroupExists = $false
         return
     }
@@ -130,6 +152,7 @@ function global:az {
             return (@{ properties = $global:AksMockPricingProperties } | ConvertTo-Json -Depth 30 -Compress)
         }
         if ($restMethod -eq 'PUT' -and $url -match '/Microsoft.Security/pricings/Containers') {
+            if ($global:AksMockPricingPutShouldFail) { $global:LASTEXITCODE = 43; return 'simulated pricing failure' }
             $bodyIndex = [Array]::IndexOf($arguments, '--body')
             $global:AksMockPricingProperties = ($arguments[$bodyIndex + 1] | ConvertFrom-Json).properties
             return
@@ -175,6 +198,9 @@ function global:az {
     if ($arguments[0] -eq 'aks' -and $arguments[1] -eq 'show') {
         return (@{
             id = "$global:AksMockResourceGroupId/providers/Microsoft.ContainerService/managedClusters/aks-runtime-lab"
+            resourceUid = 'immutable-arm-id'
+            fqdn = 'owned.eastus.azmk8s.io'
+            apiServerAccessProfile = @{ authorizedIpRanges = @('1.1.1.1/32') }
             location = 'eastus'
             tags = @{}
             securityProfile = @{
@@ -200,8 +226,22 @@ function global:az {
 
 function global:kubectl {
     $arguments = @($args | ForEach-Object { [string]$_ })
+    # The verified context deliberately differs from ProjectName; a subsequent
+    # default-context switch must not redirect any post-proof operation.
+    $capturingContext = $arguments[0] -eq 'config' -and $arguments[1] -eq 'current-context'
+    if (-not $capturingContext -and ($arguments[0] -ne '--context' -or $arguments[1] -ne 'verified-lab-context')) {
+        throw 'Kubernetes operation followed mutable current context instead of the captured identity context.'
+    }
+    if ($arguments[0] -eq '--context') { $arguments = $arguments[2..($arguments.Count-1)] }
     Add-MockCall -Command ('kubectl ' + ($arguments -join ' ')) -Mutation:($arguments[0] -eq 'delete')
     $global:LASTEXITCODE = 0
+    if ($arguments[0] -eq 'config') {
+        if ($arguments[1] -eq 'current-context') { return 'verified-lab-context' }
+        if (($arguments -join ' ') -match 'certificate-authority-data') { return [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('mock-ca')) }
+        if (($arguments -join ' ') -match 'insecure-skip-tls') { return 'false' }
+        return 'https://owned.eastus.azmk8s.io:443'
+    }
+    if ($arguments[0] -eq 'get' -and $arguments[1] -eq 'namespace' -and $arguments[2] -eq 'kube-system') { return '{"metadata":{"uid":"immutable-kube-id"}}' }
     if ($arguments[1] -eq 'crd' -and $arguments[2] -eq 'policytemplates.defender.microsoft.com') {
         if ($arguments[0] -eq 'get' -and $global:AksMockPolicyTemplateExists) {
             return 'customresourcedefinition.apiextensions.k8s.io/policytemplates.defender.microsoft.com'
@@ -226,6 +266,10 @@ function global:kubectl {
 
 function global:helm {
     $arguments = @($args | ForEach-Object { [string]$_ })
+    $contextIndex = [Array]::IndexOf($arguments, '--kube-context')
+    if ($contextIndex -lt 0 -or $arguments[$contextIndex + 1] -ne 'verified-lab-context') {
+        throw 'Helm operation followed mutable current context instead of the captured identity context.'
+    }
     Add-MockCall -Command ('helm ' + ($arguments -join ' ')) -Mutation:($arguments[0] -eq 'upgrade')
     $global:LASTEXITCODE = 0
     if ($arguments[0] -eq 'list') { return '[]' }
@@ -263,49 +307,97 @@ try {
     Assert-Condition ($runtimeSource -notmatch 'nginx:1\.14\.0') 'Runtime helper still relies on a stale arbitrary image tag.'
     Assert-Condition ($analyticsSource -notmatch 'GatedDeployment|Vulnerable Image Deployment Attempted') 'Standalone rules still invent a gated-deployment SecurityAlert schema.'
     Assert-Condition ($workbookSource -notmatch '"GatedDeployment"') 'Workbook still queries an undocumented gated-deployment alert type.'
+    Assert-Condition ($analyticsSource -notmatch 'RequestURI !has "kube-system"') 'Interactive kube-system execution is still suppressed.'
     $null = $workbookSource | ConvertFrom-Json
+
+    Reset-MockState -PricingConfigured $true
+    $rangeError = $null
+    try { & $DeployScript -SkipSentinel *> $null } catch { $rangeError = $_ }
+    Assert-Condition ($rangeError.Exception.Message -match 'explicit API server authorized') 'First deployment did not require explicit API server ranges.'
+    Assert-Condition ($global:AksMockMutationCalls.Count -eq 0 -and -not (Test-Path -LiteralPath $StatePath)) 'Missing ranges allowed a mutation.'
+    foreach ($badRange in @('0.0.0.0/0', '8.8.8.0/23', '999.1.1.1/32', '10.0.0.1/32', '8.8.8.7/24', '::1/128',
+        '192.0.2.1/32', '198.51.100.0/24', '203.0.113.255/32', '198.18.0.0/24', '198.19.255.255/32', '192.0.0.9/32', '192.88.99.0/24')) {
+        $rangeError = $null
+        try { & $DeployScript -ApiServerAuthorizedIpRanges @($badRange) -SkipSentinel *> $null } catch { $rangeError = $_ }
+        Assert-Condition ($null -ne $rangeError -and $global:AksMockMutationCalls.Count -eq 0) "Unsafe range was accepted: $badRange"
+    }
 
     Reset-MockState
     $global:AksMockPolicyTemplateExists = $true
-    $preview = & $DeployScript -WhatIf -SkipSentinel 6>&1 | Out-String
+    $preview = & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -WhatIf -SkipSentinel 6>&1 | Out-String
     Assert-Condition ($global:AksMockMutationCalls.Count -eq 0) "WhatIf mutated state: $($global:AksMockMutationCalls -join '; ')"
     Assert-Condition ($preview -match 'Deployment Preview Only' -and $preview -notmatch 'Deployment Complete') 'Preview output was misleading.'
     Assert-Condition (-not (Test-Path -LiteralPath $StatePath)) 'WhatIf wrote a manifest.'
     Assert-Condition $global:AksMockPolicyTemplateExists 'WhatIf removed a stale CRD.'
 
     $destroyRejected = $false
-    try { & $DeployScript -Destroy -WhatIf *> $null } catch { $destroyRejected = $_.Exception.Message -match 'requires the exact ownership manifest' }
+    try { & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -Destroy -WhatIf *> $null } catch { $destroyRejected = $_.Exception.Message -match 'requires the exact ownership manifest' }
     Assert-Condition $destroyRejected 'Destroy preview without a manifest was not rejected.'
 
     Reset-MockState
     Remove-Item Env:\CONFIRM_SUBSCRIPTION_SCOPE -ErrorAction SilentlyContinue
     $billingError = $null
-    try { & $DeployScript -SkipSentinel *> $null } catch { $billingError = $_ }
+    try { & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -SkipSentinel *> $null } catch { $billingError = $_ }
     Assert-Condition ($billingError.Exception.Message -match 'CONFIRM_SUBSCRIPTION_SCOPE=ENABLE-DEFENDER-FOR-CONTAINERS') 'Paid-plan gate did not fail closed.'
     Assert-Condition ($global:AksMockMutationCalls.Count -eq 0) 'Paid-plan gate allowed a mutation.'
     Assert-Condition (-not (Test-Path -LiteralPath $StatePath)) 'Paid-plan gate wrote a manifest.'
 
     Reset-MockState -PricingConfigured $true
     $global:AksMockPolicyTemplateExists = $true
-    $configuredOutput = & $DeployScript -SkipSentinel 6>&1 | Out-String
+    $configuredOutput = & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -SkipSentinel 6>&1 | Out-String
     Assert-Condition ($configuredOutput -match 'Deployment Complete') 'Configured deployment did not complete.'
     Assert-Condition (($global:AksMockMutationCalls -join "`n") -notmatch 'pricings/Containers') 'Configured pricing was rewritten.'
     Assert-Condition (Test-Path -LiteralPath $StatePath) 'Deployment did not retain its ownership manifest.'
+    $recordedIdentity = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
+    Assert-Condition ($recordedIdentity.runtimeProof.clusterResourceUid -eq 'immutable-arm-id' -and $recordedIdentity.runtimeProof.kubeSystemUid -eq 'immutable-kube-id') 'Deployment did not record both immutable cluster IDs.'
+    $beforeRerun = $global:AksMockMutationCalls.Count
+    $rangeError = $null
+    try { & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.2/32') -SkipSentinel *> $null } catch { $rangeError = $_ }
+    Assert-Condition ($rangeError.Exception.Message -match 'exact recorded' -and $global:AksMockMutationCalls.Count -eq $beforeRerun) 'Owned rerun silently changed network boundaries.'
+    & $DeployScript -SkipSentinel *> $null
+    $rerunIdentity = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
+    Assert-Condition ($rerunIdentity.apiServerAuthorizedIpRanges[0] -eq '1.1.1.1/32') 'Owned rerun did not reuse recorded ranges.'
     Assert-Condition ($configuredOutput -match 'Found 1 stale managed-sensor cluster resource') 'The policytemplates-only leftover was not inventoried.'
     $crdDeletes = @($global:AksMockMutationCalls | Where-Object { $_ -like 'kubectl delete *' })
     Assert-Condition ($crdDeletes.Count -eq 1 -and $crdDeletes[0] -match 'crd policytemplates\.defender\.microsoft\.com --ignore-not-found') 'Cleanup did not target exactly the known policytemplates CRD.'
     Assert-Condition (-not $global:AksMockPolicyTemplateExists) 'The stale policytemplates CRD was not removed before Helm.'
     $beforePreviewMutationCount = $global:AksMockMutationCalls.Count
-    $cleanupPreview = & $DeployScript -Destroy -WhatIf 6>&1 | Out-String
+    $cleanupPreview = & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -Destroy -WhatIf 6>&1 | Out-String
     Assert-Condition ($global:AksMockMutationCalls.Count -eq $beforePreviewMutationCount) 'Destroy WhatIf performed a mutation.'
     Assert-Condition ($cleanupPreview -match 'Cleanup preview complete') 'Destroy WhatIf lacked preview-only output.'
+
+    Reset-MockState
+    $env:CONFIRM_SUBSCRIPTION_SCOPE = 'ENABLE-DEFENDER-FOR-CONTAINERS'
+    & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -SkipSentinel *> $null
+    $global:AksMockGroupDeleteShouldFail = $true
+    $cleanupFailure = $null
+    try { & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -Destroy *> $null } catch { $cleanupFailure = $_ }
+    Assert-Condition ($null -ne $cleanupFailure) 'Failed group deletion was not surfaced.'
+    Assert-Condition $global:AksMockResourceGroupExists 'Failed deletion unexpectedly removed the group.'
+    Assert-Condition ($global:AksMockPricingProperties.pricingTier -eq 'Standard') 'Failed deletion downgraded the still-running cluster shared protection.'
+    Assert-Condition (Test-Path -LiteralPath $StatePath) 'Failed deletion discarded retry provenance.'
+    $global:AksMockGroupDeleteShouldFail = $false
+    $global:AksMockPricingPutShouldFail = $true
+    $cleanupFailure = $null
+    try { & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -Destroy *> $null } catch { $cleanupFailure = $_ }
+    Assert-Condition ($null -ne $cleanupFailure -and -not $global:AksMockResourceGroupExists) 'Pricing restore failure did not occur after deletion.'
+    Assert-Condition (Test-Path -LiteralPath $StatePath) 'Pricing restore failure discarded retry provenance.'
+    $global:AksMockGroupExistsShouldFail = $true
+    $beforeFailedLookup = $global:AksMockMutationCalls.Count
+    $lookupFailure = $null
+    try { & $DeployScript -Destroy *> $null } catch { $lookupFailure = $_ }
+    Assert-Condition ($null -ne $lookupFailure -and $global:AksMockMutationCalls.Count -eq $beforeFailedLookup) 'Lookup failure was treated as absence and allowed pricing mutation.'
+    $global:AksMockGroupExistsShouldFail = $false
+    $global:AksMockPricingPutShouldFail = $false
+    & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -Destroy *> $null
+    Assert-Condition ($global:AksMockPricingProperties.pricingTier -eq 'Free' -and -not (Test-Path -LiteralPath $StatePath)) 'Retry failed to restore shared pricing and finish cleanup.'
 
     Reset-MockState -PricingConfigured $true
     $global:AksMockResourceGroupExists = $true
     $global:AksMockOwnerToken = 'foreign-owner'
     $global:AksMockPolicyTemplateExists = $true
     $foreignGroupError = $null
-    try { & $DeployScript -SkipSentinel *> $null } catch { $foreignGroupError = $_ }
+    try { & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -SkipSentinel *> $null } catch { $foreignGroupError = $_ }
     Assert-Condition ($foreignGroupError.Exception.Message -match 'without this lab.s ownership manifest') 'Foreign resource group was not refused.'
     Assert-Condition ($global:AksMockMutationCalls.Count -eq 0) 'Foreign ownership allowed cloud or CRD mutation.'
     Assert-Condition $global:AksMockPolicyTemplateExists 'Foreign cluster CRD was removed.'
@@ -314,7 +406,7 @@ try {
     $env:CONFIRM_SUBSCRIPTION_SCOPE = 'ENABLE-DEFENDER-FOR-CONTAINERS'
     $global:AksMockHelmShouldFail = $true
     $helmError = $null
-    try { & $DeployScript -SkipSentinel *> $null } catch { $helmError = $_ }
+    try { & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -SkipSentinel *> $null } catch { $helmError = $_ }
     Assert-Condition ($helmError.Exception.Message -match 'prior Defender profile') 'Forced Helm failure did not surface rollback.'
     Assert-Condition ([string]$global:AksMockPricingProperties.pricingTier -eq 'Free') 'Deployment failure did not restore prior shared pricing.'
     Assert-Condition (-not (Test-Path -LiteralPath $global:AksMockValuesFilePath)) 'Secret values file survived failure.'
@@ -322,11 +414,11 @@ try {
     Reset-MockState -PricingConfigured $true
     $global:AksMockPodsReady = $false
     $readinessError = $null
-    try { & $DeployScript -SkipSentinel *> $null } catch { $readinessError = $_ }
+    try { & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -SkipSentinel *> $null } catch { $readinessError = $_ }
     Assert-Condition ($readinessError.Exception.Message -match 'Running/Ready') 'Unready sensor pods did not fail deployment.'
 
     Reset-MockState -PricingConfigured $true
-    $sentinelOutput = & $DeployScript 6>&1 | Out-String
+    $sentinelOutput = & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') 6>&1 | Out-String
     $sentinelMutations = @($global:AksMockMutationCalls | Where-Object { $_ -match 'alertRules/.+--body' })
     Assert-Condition ($sentinelMutations.Count -eq 3) "Expected three rule writes, found $($sentinelMutations.Count)."
     Assert-Condition ($sentinelOutput -match '3 disabled owned analytics rules') 'Default rule state was not reported as disabled.'
@@ -340,7 +432,7 @@ try {
     )
     $legacyState | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $StatePath -Encoding utf8NoBOM
     $beforeMigrationCallCount = $global:AksMockMutationCalls.Count
-    $migrationOutput = & $DeployScript 6>&1 | Out-String
+    $migrationOutput = & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') 6>&1 | Out-String
     $migrationCalls = @($global:AksMockMutationCalls | Select-Object -Skip $beforeMigrationCallCount)
     Assert-Condition (($migrationCalls -join "`n") -match "--method DELETE.+alertRules/$global:AksMockLegacyGatedRuleId") 'Manifest-owned legacy gated rule was not deleted.'
     Assert-Condition ($migrationOutput -match 'Deprecated gated-deployment Sentinel rule: Removed') 'Legacy-rule migration was not reported.'
@@ -350,13 +442,13 @@ try {
     Reset-MockState -PricingConfigured $true
     $global:AksMockRulePutShouldFail = $true
     $ruleError = $null
-    try { & $DeployScript *> $null } catch { $ruleError = $_ }
+    try { & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') *> $null } catch { $ruleError = $_ }
     Assert-Condition ($ruleError.Exception.Message -match 'Sentinel rule deployment') 'Rule PUT failure was not fatal.'
 
     Reset-MockState -PricingConfigured $true
     $global:AksMockForeignWorkbook = $true
     $collisionError = $null
-    try { & $DeployScript *> $null } catch { $collisionError = $_ }
+    try { & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') *> $null } catch { $collisionError = $_ }
     Assert-Condition ($collisionError.Exception.Message -match 'Refusing to overwrite workbook|another resource already uses') 'Foreign workbook collision was not rejected.'
     $postCollisionSentinelWrites = @($global:AksMockMutationCalls | Where-Object { $_ -match 'dataConnectors|alertRules|workbooks' -and $_ -match '--method PUT' })
     Assert-Condition ($postCollisionSentinelWrites.Count -eq 0) 'Workbook collision allowed a partial Sentinel write.'

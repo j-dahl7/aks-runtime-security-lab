@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 7.4
 
 <#
 .SYNOPSIS
@@ -25,6 +25,10 @@
 .PARAMETER SkipSentinel
     Skip deploying Sentinel analytics rules and workbook.
 
+.PARAMETER ApiServerAuthorizedIpRanges
+    Operator egress IPv4 CIDRs, /24 through /32. Required for first deployment.
+    Owned reruns reuse the exact recorded ranges when this parameter is omitted.
+
 .PARAMETER EnableSentinelRules
     Enable the three Sentinel analytics rules after query and telemetry review.
     Without this switch, the script creates or updates these lab rules disabled.
@@ -36,11 +40,11 @@
     Preview all changes without deploying.
 
 .EXAMPLE
-    ./Deploy-Lab.ps1 -Location "eastus"
+    ./Deploy-Lab.ps1 -Location "eastus" -ApiServerAuthorizedIpRanges '<your-public-egress-ip>/32'
     Deploy the full lab to East US.
 
 .EXAMPLE
-    ./Deploy-Lab.ps1 -Location "eastus" -SkipSentinel
+    ./Deploy-Lab.ps1 -Location "eastus" -ApiServerAuthorizedIpRanges '<your-public-egress-ip>/32' -SkipSentinel
     Deploy infrastructure only, skip Sentinel rules.
 
 .EXAMPLE
@@ -57,6 +61,8 @@ param(
     [ValidatePattern('^[a-z0-9][a-z0-9-]{1,18}[a-z0-9]$')]
     [string]$ProjectName = 'aks-runtime-lab',
 
+    [string[]]$ApiServerAuthorizedIpRanges = @(),
+
     [Parameter()]
     [switch]$SkipSentinel,
 
@@ -70,6 +76,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LabRoot = Split-Path -Parent $ScriptDir
+. (Join-Path $ScriptDir 'Cluster-Identity.ps1')
 $ResourceGroup = "$ProjectName-rg"
 $WorkspaceName = "$ProjectName-law"
 $DefenderPolicyDefinitionId = '64def556-fbad-4622-930e-72d1d5589bf5'
@@ -112,6 +119,15 @@ function Invoke-AzJson {
     }
     if (-not $text) { return $null }
     return $text | ConvertFrom-Json
+}
+
+function Get-LabResourceGroup {
+    $exists = Invoke-AzJson -Arguments @('group', 'exists', '--name', $ResourceGroup, '--subscription', $subscriptionId, '--output', 'json')
+    if ($exists -isnot [bool]) { throw 'Azure did not return a boolean resource-group existence result.' }
+    if (-not $exists) { return $null }
+    $group = Invoke-AzJson -Arguments @('group', 'show', '--name', $ResourceGroup, '--subscription', $subscriptionId, '--output', 'json')
+    if (-not $group -or $group.id -ne $resourceGroupId) { throw 'Resource-group lookup did not return the expected resource ID.' }
+    return $group
 }
 
 function Read-LabState {
@@ -456,7 +472,7 @@ function Get-ConflictingDefenderPolicyAssignments {
     )
 
     foreach ($scopeArguments in $scopeArgumentSets) {
-        $json = az policy assignment list @scopeArguments --output json
+        $json = az policy assignment list @scopeArguments --subscription $SubscriptionId --output json
         Assert-LastExitCode -Action 'Defender auto-provision policy lookup'
         if (-not [string]::IsNullOrWhiteSpace(($json -join "`n"))) {
             $assignments += @(($json -join "`n") | ConvertFrom-Json)
@@ -471,6 +487,7 @@ function Get-ConflictingDefenderPolicyAssignments {
 }
 
 function Get-StaleDefenderClusterResources {
+    param([Parameter(Mandatory)][string]$Context)
     $resourceSelectors = @(
         @{ Kind = 'crd'; Name = 'policies.defender.microsoft.com' },
         @{ Kind = 'crd'; Name = 'policytemplates.defender.microsoft.com' },
@@ -484,7 +501,7 @@ function Get-StaleDefenderClusterResources {
 
     $existing = @()
     foreach ($selector in $resourceSelectors) {
-        $result = kubectl get $selector.Kind $selector.Name --ignore-not-found --output name 2>$null
+        $result = kubectl --context $Context get $selector.Kind $selector.Name --ignore-not-found --output name 2>$null
         Assert-LastExitCode -Action "Kubernetes preflight for $($selector.Kind)/$($selector.Name)"
         if (-not [string]::IsNullOrWhiteSpace(($result -join "`n"))) {
             $existing += $selector
@@ -495,6 +512,9 @@ function Get-StaleDefenderClusterResources {
 
 function Restore-ClusterProtectionState {
     param(
+        [Parameter(Mandatory)]
+        [string]$SubscriptionId,
+
         [Parameter(Mandatory)]
         [string]$ResourceGroupName,
 
@@ -522,6 +542,7 @@ function Restore-ClusterProtectionState {
     if ($DefenderWasEnabled) {
         $enableArguments = @(
             'aks', 'update',
+            '--subscription', $SubscriptionId,
             '--resource-group', $ResourceGroupName,
             '--name', $ClusterName,
             '--enable-defender',
@@ -540,6 +561,7 @@ function Restore-ClusterProtectionState {
     if ($ExclusionTagExisted) {
         az tag update `
             --resource-id $ClusterId `
+            --subscription $SubscriptionId `
             --operation merge `
             --tags "${DefenderExclusionTag}=$ExclusionTagValue" `
             --output none
@@ -547,6 +569,7 @@ function Restore-ClusterProtectionState {
     else {
         az tag update `
             --resource-id $ClusterId `
+            --subscription $SubscriptionId `
             --operation delete `
             --tags $DefenderExclusionTag `
             --output none
@@ -581,8 +604,8 @@ foreach ($tool in $requiredTools) {
     }
 }
 
-$account = Invoke-AzJson -Arguments @('account', 'show', '--query', '{id:id,name:name}', '--output', 'json')
-if (-not $account.id) {
+$account = Invoke-AzJson -Arguments @('account', 'show', '--query', '{id:id,name:name,tenantId:tenantId}', '--output', 'json')
+if (-not $account.id -or -not $account.tenantId) {
     throw "Azure CLI is not signed in. Run 'az login' and select the intended subscription."
 }
 Write-Host "  Subscription: $($account.name) ($($account.id))"
@@ -592,13 +615,14 @@ $resourceGroupId = "/subscriptions/$subscriptionId/resourceGroups/$ResourceGroup
 $workspaceId = "$resourceGroupId/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName"
 $pricingUrl = "https://management.azure.com/subscriptions/$subscriptionId/providers/Microsoft.Security/pricings/Containers?api-version=$PricingApiVersion"
 $state = Read-LabState
-$existingResourceGroup = Invoke-AzJson -Arguments @('group', 'show', '--name', $ResourceGroup, '--output', 'json') -NotFoundIsNull
+$existingResourceGroup = Get-LabResourceGroup
 
 if ($state) {
     Assert-LabStateContext -State $state -SubscriptionId $subscriptionId -ExpectedResourceGroupId $resourceGroupId
     if ($state.projectName -ne $ProjectName -or $state.workspaceId -ne $workspaceId) {
         throw 'Ownership manifest does not match this project and workspace.'
     }
+    if ($state.tenantId -and $state.tenantId -ne $account.tenantId) { throw 'Ownership manifest belongs to a different tenant.' }
     if ($existingResourceGroup -and [string]$existingResourceGroup.tags.$OwnershipTagName -ne [string]$state.ownerToken) {
         throw "Refusing to use resource group '$ResourceGroup': its ownership tag does not match the manifest."
     }
@@ -614,25 +638,34 @@ if ($Destroy) {
     }
 
     $pricingCurrent = $null
+    $pricingAlreadyRestored = $false
     if ([bool]$state.pricingChanged) {
         $pricingCurrent = Invoke-AzJson -Arguments @('rest', '--method', 'GET', '--url', $pricingUrl, '--only-show-errors', '--output', 'json')
-        if ((Get-PricingFingerprint $pricingCurrent.properties) -ne (Get-PricingFingerprint $state.pricingDesired)) {
+        $pricingAlreadyRestored = (Get-PricingFingerprint $pricingCurrent.properties) -eq (Get-PricingFingerprint $state.pricingBefore)
+        if (-not $pricingAlreadyRestored -and (Get-PricingFingerprint $pricingCurrent.properties) -ne (Get-PricingFingerprint $state.pricingDesired)) {
             throw 'Refusing cleanup because the shared Defender pricing setting changed after this lab configured it.'
         }
     }
 
     Write-Host "[!] Destroying exact manifest-owned lab resources..." -ForegroundColor Yellow
-    if ([bool]$state.pricingChanged -and $PSCmdlet.ShouldProcess('Defender for Containers pricing', 'Restore captured pre-lab shared setting')) {
-        Set-PricingProperties -Url $pricingUrl -Properties $state.pricingBefore -Action 'Defender for Containers pricing restore'
-    }
     if ($existingResourceGroup -and $PSCmdlet.ShouldProcess($resourceGroupId, 'Delete exact manifest-owned resource group')) {
-        az group delete --name $ResourceGroup --yes
+        az group delete --name $ResourceGroup --subscription $subscriptionId --yes
         Assert-LastExitCode -Action "Resource-group deletion for $ResourceGroup"
     }
     if (-not $WhatIfPreference) {
-        $remainingGroup = Invoke-AzJson -Arguments @('group', 'show', '--name', $ResourceGroup, '--output', 'json') -NotFoundIsNull
+        $remainingGroup = Get-LabResourceGroup
         if ($remainingGroup) {
             throw "Resource group '$ResourceGroup' still exists; the manifest was retained for a safe retry."
+        }
+        # Keep protection in place until deletion is verified. A retained manifest
+        # makes a failed restore (or a prior successful restore) safely resumable.
+        if ([bool]$state.pricingChanged -and -not $pricingAlreadyRestored) {
+            $pricingLatest = Invoke-AzJson -Arguments @('rest', '--method', 'GET', '--url', $pricingUrl, '--only-show-errors', '--output', 'json')
+            if ((Get-PricingFingerprint $pricingLatest.properties) -ne (Get-PricingFingerprint $state.pricingDesired)) { throw 'Shared pricing changed during deletion; manifest retained and pricing not overwritten.' }
+            if (-not $PSCmdlet.ShouldProcess('Defender for Containers pricing', 'Restore captured pre-lab shared setting after verified deletion')) { return }
+            Set-PricingProperties -Url $pricingUrl -Properties $state.pricingBefore -Action 'Defender for Containers pricing restore'
+            $restored = Invoke-AzJson -Arguments @('rest', '--method', 'GET', '--url', $pricingUrl, '--only-show-errors', '--output', 'json')
+            if ((Get-PricingFingerprint $restored.properties) -ne (Get-PricingFingerprint $state.pricingBefore)) { throw 'Shared pricing restore was not verified; manifest retained.' }
         }
         if ($PSCmdlet.ShouldProcess($StatePath, 'Remove ownership manifest after verified cleanup')) {
             Remove-Item -LiteralPath $StatePath -Force
@@ -643,6 +676,18 @@ if ($Destroy) {
         Write-Host '[+] Cleanup preview complete; no changes were made.' -ForegroundColor Cyan
     }
     return
+}
+
+if ($state.apiServerAuthorizedIpRanges) {
+    if ($ApiServerAuthorizedIpRanges.Count -and (@($ApiServerAuthorizedIpRanges | Sort-Object) -join ',') -ne (@($state.apiServerAuthorizedIpRanges | Sort-Object) -join ',')) {
+        throw 'Owned reruns must use the exact recorded API server authorized ranges.'
+    }
+    $ApiServerAuthorizedIpRanges = @($state.apiServerAuthorizedIpRanges)
+}
+Assert-ApiServerRanges -Ranges $ApiServerAuthorizedIpRanges
+if ($existingResourceGroup -and $state.runtimeProof) {
+    $liveCluster = Invoke-AzJson -Arguments @('aks', 'show', '--resource-group', $ResourceGroup, '--name', $ProjectName, '--subscription', $subscriptionId, '--output', 'json')
+    Assert-LiveCluster -State $state -Cluster $liveCluster
 }
 
 $currentPricingResource = Invoke-AzJson -Arguments @('rest', '--method', 'GET', '--url', $pricingUrl, '--only-show-errors', '--output', 'json')
@@ -671,6 +716,8 @@ else {
         projectName = $ProjectName
         ownerToken = $ownerToken
         subscriptionId = $subscriptionId
+        tenantId = [string]$account.tenantId
+        apiServerAuthorizedIpRanges = @($ApiServerAuthorizedIpRanges)
         resourceGroupId = $resourceGroupId
         workspaceId = $workspaceId
         pricingChanged = $defenderPlanNeedsUpdate
@@ -718,6 +765,11 @@ No deployment changes were made.
 if (-not (Test-Path -LiteralPath $StatePath)) {
     Write-LabState -State $state
 }
+else {
+    $state | Add-Member -NotePropertyName tenantId -NotePropertyValue ([string]$account.tenantId) -Force
+    $state | Add-Member -NotePropertyName apiServerAuthorizedIpRanges -NotePropertyValue @($ApiServerAuthorizedIpRanges) -Force
+    Write-LabState -State $state
+}
 
 # ---------- Deploy Infrastructure ----------
 Write-Host "`n[2/7] Deploying infrastructure (Bicep)..." -ForegroundColor Yellow
@@ -726,9 +778,10 @@ $bicepPath = Join-Path $LabRoot 'bicep/main.bicep'
 
 if ($PSCmdlet.ShouldProcess("Subscription", "Deploy Bicep template")) {
     $deployment = az deployment sub create `
+        --subscription $subscriptionId `
         --location $Location `
         --template-file $bicepPath `
-        --parameters projectName=$ProjectName location=$Location ownerToken=$ownerToken `
+        --parameters projectName=$ProjectName location=$Location ownerToken=$ownerToken "apiServerAuthorizedIpRanges=$(ConvertTo-Json -InputObject @($ApiServerAuthorizedIpRanges) -Compress)" `
         --query 'properties.outputs' -o json | ConvertFrom-Json
     Assert-LastExitCode -Action 'AKS lab infrastructure deployment'
 
@@ -739,10 +792,12 @@ if ($PSCmdlet.ShouldProcess("Subscription", "Deploy Bicep template")) {
         throw 'The infrastructure deployment did not return the expected cluster and workspace outputs.'
     }
 
-    $ownedResourceGroup = Invoke-AzJson -Arguments @('group', 'show', '--name', $ResourceGroup, '--output', 'json')
+    $ownedResourceGroup = Get-LabResourceGroup
     if ([string]$ownedResourceGroup.tags.$OwnershipTagName -ne $ownerToken) {
         throw 'Resource group deployment did not preserve the manifest ownership token.'
     }
+    $liveCluster = Invoke-AzJson -Arguments @('aks', 'show', '--resource-group', $ResourceGroup, '--name', $ProjectName, '--subscription', $subscriptionId, '--output', 'json')
+    Assert-LiveCluster -State $state -Cluster $liveCluster
 
     Write-Host "  AKS Cluster:  $clusterName" -ForegroundColor Green
     Write-Host "  Workspace:    $WorkspaceName" -ForegroundColor Green
@@ -774,12 +829,18 @@ Write-Host "`n[4/7] Getting AKS credentials..." -ForegroundColor Yellow
 
 if ($PSCmdlet.ShouldProcess($clusterName, "Get AKS credentials")) {
     az aks get-credentials `
+        --subscription $subscriptionId `
         --resource-group $ResourceGroup `
         --name $clusterName `
         --overwrite-existing
     Assert-LastExitCode -Action 'AKS kubeconfig update'
 
-    Write-Host "  kubectl context set to: $clusterName" -ForegroundColor Green
+    $identity = Get-KubeClusterProof -State $state -Cluster $liveCluster
+    if ($state -is [System.Collections.IDictionary]) { $state['runtimeProof'] = $identity.proof }
+    else { $state | Add-Member -NotePropertyName runtimeProof -NotePropertyValue $identity.proof -Force }
+    Write-LabState -State $state
+
+    Write-Host "  Verified kubectl context: $($identity.context)" -ForegroundColor Green
 }
 
 # ---------- Deploy Defender Sensor via Helm ----------
@@ -788,6 +849,7 @@ Write-Host "`n[5/7] Deploying Defender sensor via Helm (with anti-malware)..." -
 if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
     $subscriptionId = $account.id
     $clusterJson = az aks show `
+        --subscription $subscriptionId `
         --resource-group $ResourceGroup `
         --name $clusterName `
         --output json
@@ -824,7 +886,7 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
         throw ('Conflicting Defender auto-provision policy assignments found: {0}. Remove or exempt the lab scope before installing the Helm-managed sensor.' -f ($policySummary -join '; '))
     }
 
-    $helmReleaseJson = helm list --all --namespace mdc --output json
+    $helmReleaseJson = helm list --kube-context $identity.context --all --namespace mdc --output json
     Assert-LastExitCode -Action 'Existing Defender Helm release lookup'
     $helmReleases = if ([string]::IsNullOrWhiteSpace(($helmReleaseJson -join "`n"))) {
         @()
@@ -846,13 +908,14 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
         $_.name -eq $DefenderHelmReleaseName
     }).Count -gt 0
     $staleClusterResources = @(if (-not $currentReleaseExists) {
-        Get-StaleDefenderClusterResources
+        Get-StaleDefenderClusterResources -Context $identity.context
     })
     if ($staleClusterResources.Count -gt 0) {
         Write-Host "  Found $($staleClusterResources.Count) stale managed-sensor cluster resource(s); exact known resources will be removed before Helm." -ForegroundColor Yellow
     }
 
     $workspaceCustomerId = az monitor log-analytics workspace show `
+        --subscription $subscriptionId `
         --resource-group $ResourceGroup `
         --workspace-name $WorkspaceName `
         --query customerId `
@@ -861,6 +924,7 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
     $workspaceCustomerId = [string](($workspaceCustomerId | Select-Object -First 1)).Trim()
 
     $workspaceSharedKey = az monitor log-analytics workspace get-shared-keys `
+        --subscription $subscriptionId `
         --resource-group $ResourceGroup `
         --workspace-name $WorkspaceName `
         --query primarySharedKey `
@@ -905,6 +969,7 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
         try {
             # A Helm-managed sensor must not coexist with the AKS Defender profile.
             az aks update `
+                --subscription $subscriptionId `
                 --resource-group $ResourceGroup `
                 --name $clusterName `
                 --disable-defender `
@@ -913,6 +978,7 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
 
             # Exclude this cluster from automatic rediscovery while the sensor is Helm-managed.
             az tag update `
+                --subscription $subscriptionId `
                 --resource-id $clusterId `
                 --operation merge `
                 --tags "${DefenderExclusionTag}=true" `
@@ -920,12 +986,13 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
             Assert-LastExitCode -Action 'Applying the Defender Helm-management exclusion tag'
 
             foreach ($resource in $staleClusterResources) {
-                kubectl delete $resource.Kind $resource.Name --ignore-not-found 2>$null
+                kubectl --context $identity.context delete $resource.Kind $resource.Name --ignore-not-found 2>$null
                 Assert-LastExitCode -Action "Removing stale $($resource.Kind)/$($resource.Name)"
             }
 
             helm upgrade --install $DefenderHelmReleaseName `
                 $DefenderHelmChart `
+                --kube-context $identity.context `
                 --version $DefenderHelmChartVersion `
                 --namespace mdc `
                 --create-namespace `
@@ -940,6 +1007,7 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
             Write-Warning 'Defender Helm deployment failed. Restoring the cluster protection state captured before installation.'
             try {
                 Restore-ClusterProtectionState `
+                    -SubscriptionId $subscriptionId `
                     -ResourceGroupName $ResourceGroup `
                     -ClusterName $clusterName `
                     -ClusterId $clusterId `
@@ -966,7 +1034,7 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
     $retries = 0
     $maxRetries = 12
     while ($retries -lt $maxRetries) {
-        $podJson = kubectl get pods -n mdc -o json 2>$null
+        $podJson = kubectl --context $identity.context get pods -n mdc -o json 2>$null
         Assert-LastExitCode -Action 'Defender sensor readiness lookup'
         $defenderPods = @((($podJson -join "`n") | ConvertFrom-Json).items | Where-Object {
             $_.metadata.name -match '(?i)(microsoft-defender|defender)'
@@ -1074,7 +1142,6 @@ AzureDiagnostics
 | extend Username = tostring(RequestObject.user.username)
 | where Verb in ("create", "get")
 | where RequestURI has "/exec"
-| where RequestURI !has "kube-system"
 | extend PodName = extract(@"/pods/([^/]+)/exec", 1, RequestURI)
 | extend Namespace = extract(@"namespaces/([^/]+)/", 1, RequestURI)
 | project TimeGenerated, Username, SourceIP, PodName, Namespace, UserAgent, RequestURI
@@ -1159,6 +1226,7 @@ AzureDiagnostics
     }
     $listedWorkbooks = @(Invoke-AzJson -Arguments @(
         'resource', 'list', '--resource-group', $ResourceGroup,
+        '--subscription', $subscriptionId,
         '--resource-type', 'Microsoft.Insights/workbooks', '--output', 'json'
     ))
     $workbookCollisions = @($listedWorkbooks | Where-Object {
