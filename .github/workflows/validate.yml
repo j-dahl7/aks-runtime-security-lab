@@ -1,0 +1,37 @@
+name: Validate AKS lab safety
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Compile Bicep without deploying resources
+        run: |
+          az bicep install --version v0.45.6
+          az bicep build --file bicep/main.bicep --stdout >/dev/null
+
+      - name: Parse PowerShell scripts
+        shell: pwsh
+        run: |
+          Get-ChildItem scripts,tests -Filter '*.ps1' -Recurse | ForEach-Object {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count) { throw ($errors | Out-String) }
+          }
+
+      - name: Run offline ownership and rollback mocks
+        shell: pwsh
+        run: ./tests/Test-DeployLabSafety.ps1

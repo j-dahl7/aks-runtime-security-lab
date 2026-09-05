@@ -10,6 +10,9 @@ $RuntimeTestScript = Join-Path $Root 'scripts/Test-RuntimeSecurity.ps1'
 $AnalyticsRules = Join-Path $Root 'detection/analytics-rules.kql'
 $Workbook = Join-Path $Root 'workbook/container-runtime-workbook.json'
 $StatePath = Join-Path $Root '.aks-runtime-lab-state-aks-runtime-lab.json'
+if (Test-Path -LiteralPath $StatePath) {
+    throw 'Refusing to run the mocked safety harness over an existing ownership manifest. Use a fresh checkout.'
+}
 $global:AksMockSubscriptionId = '00000000-0000-0000-0000-000000000000'
 $global:AksMockResourceGroupId = "/subscriptions/$global:AksMockSubscriptionId/resourceGroups/aks-runtime-lab-rg"
 $global:AksMockWorkspaceResourceId = "$global:AksMockResourceGroupId/providers/Microsoft.OperationalInsights/workspaces/aks-runtime-lab-law"
@@ -68,6 +71,7 @@ function Reset-MockState {
     $global:AksMockValuesFilePath = $null
     $global:AksMockValuesDirectory = $null
     $global:AksMockPricingProperties = New-MockPricingProperties -Configured $PricingConfigured
+    $global:AksMockPolicyTemplateExists = $false
 }
 
 function Add-MockCall {
@@ -198,6 +202,13 @@ function global:kubectl {
     $arguments = @($args | ForEach-Object { [string]$_ })
     Add-MockCall -Command ('kubectl ' + ($arguments -join ' ')) -Mutation:($arguments[0] -eq 'delete')
     $global:LASTEXITCODE = 0
+    if ($arguments[1] -eq 'crd' -and $arguments[2] -eq 'policytemplates.defender.microsoft.com') {
+        if ($arguments[0] -eq 'get' -and $global:AksMockPolicyTemplateExists) {
+            return 'customresourcedefinition.apiextensions.k8s.io/policytemplates.defender.microsoft.com'
+        }
+        if ($arguments[0] -eq 'delete') { $global:AksMockPolicyTemplateExists = $false }
+        return
+    }
     if ($arguments[0] -eq 'get' -and $arguments[1] -eq 'pods') {
         $ready = [bool]$global:AksMockPodsReady
         $phase = if ($ready) { 'Running' } else { 'Pending' }
@@ -239,6 +250,8 @@ function global:helm {
 function global:Start-Sleep { param() }
 
 try {
+    $enableHelp = Get-Help $DeployScript -Parameter EnableSentinelRules | Out-String
+    Assert-Condition ($enableHelp -match 'Without this switch' -and $enableHelp -match 'disabled') 'Get-Help does not explain default-disabled Sentinel rules.'
     $runtimeSource = Get-Content -LiteralPath $RuntimeTestScript -Raw
     $analyticsSource = Get-Content -LiteralPath $AnalyticsRules -Raw
     $workbookSource = Get-Content -LiteralPath $Workbook -Raw
@@ -253,10 +266,12 @@ try {
     $null = $workbookSource | ConvertFrom-Json
 
     Reset-MockState
+    $global:AksMockPolicyTemplateExists = $true
     $preview = & $DeployScript -WhatIf -SkipSentinel 6>&1 | Out-String
     Assert-Condition ($global:AksMockMutationCalls.Count -eq 0) "WhatIf mutated state: $($global:AksMockMutationCalls -join '; ')"
     Assert-Condition ($preview -match 'Deployment Preview Only' -and $preview -notmatch 'Deployment Complete') 'Preview output was misleading.'
     Assert-Condition (-not (Test-Path -LiteralPath $StatePath)) 'WhatIf wrote a manifest.'
+    Assert-Condition $global:AksMockPolicyTemplateExists 'WhatIf removed a stale CRD.'
 
     $destroyRejected = $false
     try { & $DeployScript -Destroy -WhatIf *> $null } catch { $destroyRejected = $_.Exception.Message -match 'requires the exact ownership manifest' }
@@ -271,14 +286,29 @@ try {
     Assert-Condition (-not (Test-Path -LiteralPath $StatePath)) 'Paid-plan gate wrote a manifest.'
 
     Reset-MockState -PricingConfigured $true
+    $global:AksMockPolicyTemplateExists = $true
     $configuredOutput = & $DeployScript -SkipSentinel 6>&1 | Out-String
     Assert-Condition ($configuredOutput -match 'Deployment Complete') 'Configured deployment did not complete.'
     Assert-Condition (($global:AksMockMutationCalls -join "`n") -notmatch 'pricings/Containers') 'Configured pricing was rewritten.'
     Assert-Condition (Test-Path -LiteralPath $StatePath) 'Deployment did not retain its ownership manifest.'
+    Assert-Condition ($configuredOutput -match 'Found 1 stale managed-sensor cluster resource') 'The policytemplates-only leftover was not inventoried.'
+    $crdDeletes = @($global:AksMockMutationCalls | Where-Object { $_ -like 'kubectl delete *' })
+    Assert-Condition ($crdDeletes.Count -eq 1 -and $crdDeletes[0] -match 'crd policytemplates\.defender\.microsoft\.com --ignore-not-found') 'Cleanup did not target exactly the known policytemplates CRD.'
+    Assert-Condition (-not $global:AksMockPolicyTemplateExists) 'The stale policytemplates CRD was not removed before Helm.'
     $beforePreviewMutationCount = $global:AksMockMutationCalls.Count
     $cleanupPreview = & $DeployScript -Destroy -WhatIf 6>&1 | Out-String
     Assert-Condition ($global:AksMockMutationCalls.Count -eq $beforePreviewMutationCount) 'Destroy WhatIf performed a mutation.'
     Assert-Condition ($cleanupPreview -match 'Cleanup preview complete') 'Destroy WhatIf lacked preview-only output.'
+
+    Reset-MockState -PricingConfigured $true
+    $global:AksMockResourceGroupExists = $true
+    $global:AksMockOwnerToken = 'foreign-owner'
+    $global:AksMockPolicyTemplateExists = $true
+    $foreignGroupError = $null
+    try { & $DeployScript -SkipSentinel *> $null } catch { $foreignGroupError = $_ }
+    Assert-Condition ($foreignGroupError.Exception.Message -match 'without this lab.s ownership manifest') 'Foreign resource group was not refused.'
+    Assert-Condition ($global:AksMockMutationCalls.Count -eq 0) 'Foreign ownership allowed cloud or CRD mutation.'
+    Assert-Condition $global:AksMockPolicyTemplateExists 'Foreign cluster CRD was removed.'
 
     Reset-MockState
     $env:CONFIRM_SUBSCRIPTION_SCOPE = 'ENABLE-DEFENDER-FOR-CONTAINERS'

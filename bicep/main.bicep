@@ -1,8 +1,10 @@
 // AKS Runtime Security Lab - Main Orchestrator
 // Deploys AKS cluster with Defender for Containers, Log Analytics, and Container Insights
 //
-// Usage:
-//   az deployment sub create --location eastus --template-file main.bicep --parameters location=eastus
+// Supported entry point from the repository root:
+//   ./scripts/Deploy-Lab.ps1 -Location eastus -WhatIf
+// Use that ownership-aware orchestrator for deployment; it supplies the secure
+// ownerToken and records the rollback manifest. Direct Bicep deployment is unsupported.
 //
 // Note: Defender for Containers plan enablement, drift policies, and Sentinel rules
 // are configured separately via PowerShell due to REST API dependencies.

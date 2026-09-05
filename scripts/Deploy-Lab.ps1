@@ -1,4 +1,5 @@
 #Requires -Version 7.0
+
 <#
 .SYNOPSIS
     Deploys the AKS Runtime Security Lab.
@@ -8,7 +9,7 @@
     1. AKS cluster via Bicep (no Defender security profile)
     2. Defender for Containers plan enablement (with AntiMalware extension)
     3. Defender sensor via Helm chart (pinned 0.11.4 with anti-malware collector)
-    4. Sentinel analytics rules (3 scheduled rules)
+    4. Sentinel analytics rules (3 scheduled rules, disabled unless explicitly enabled)
     5. Sentinel workbook (Container Runtime Security Dashboard)
 
     NOTE: Binary drift policy must be configured manually in the Azure portal
@@ -23,6 +24,10 @@
 
 .PARAMETER SkipSentinel
     Skip deploying Sentinel analytics rules and workbook.
+
+.PARAMETER EnableSentinelRules
+    Enable the three Sentinel analytics rules after query and telemetry review.
+    Without this switch, the script creates or updates these lab rules disabled.
 
 .PARAMETER Destroy
     Tear down the lab (delete resource group).
@@ -468,6 +473,7 @@ function Get-ConflictingDefenderPolicyAssignments {
 function Get-StaleDefenderClusterResources {
     $resourceSelectors = @(
         @{ Kind = 'crd'; Name = 'policies.defender.microsoft.com' },
+        @{ Kind = 'crd'; Name = 'policytemplates.defender.microsoft.com' },
         @{ Kind = 'crd'; Name = 'runtimepolicies.defender.microsoft.com' },
         @{ Kind = 'crd'; Name = 'securityartifactpolicies.defender.microsoft.com' },
         @{ Kind = 'clusterrole'; Name = 'defender-admission-controller-cluster-role' },
@@ -839,12 +845,9 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
     $currentReleaseExists = @($defenderReleases | Where-Object {
         $_.name -eq $DefenderHelmReleaseName
     }).Count -gt 0
-    $staleClusterResources = if ($currentReleaseExists) {
-        @()
-    }
-    else {
-        @(Get-StaleDefenderClusterResources)
-    }
+    $staleClusterResources = @(if (-not $currentReleaseExists) {
+        Get-StaleDefenderClusterResources
+    })
     if ($staleClusterResources.Count -gt 0) {
         Write-Host "  Found $($staleClusterResources.Count) stale managed-sensor cluster resource(s); exact known resources will be removed before Helm." -ForegroundColor Yellow
     }
