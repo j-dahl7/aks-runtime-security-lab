@@ -161,12 +161,29 @@ function Invoke-AzJson {
     }
     if ($exitCode -ne 0) {
         $errorText = "$stderr`n$text"
-        if ($NotFoundIsNull -and $errorText -match '(?im)^\s*(?:ERROR:\s*)?\((?:ResourceGroupNotFound|ResourceNotFound)\)') {
-            return $null
+        $providerCode = $null
+        $isNotFound = $false
+        if ($errorText -match '(?im)^\s*(?:ERROR:\s*)?\(([A-Za-z][A-Za-z0-9_.]{0,79})\)') {
+            $providerCode = $Matches[1]
+            $isNotFound = $providerCode -in @('ResourceGroupNotFound', 'ResourceNotFound', 'Request_ResourceNotFound')
         }
+        elseif ($errorText.Trim() -match '^(?s)(?:ERROR:\s*)?(?<reason>Bad Request|Unauthorized|Forbidden|Not Found|Conflict|Too Many Requests|Internal Server Error|Service Unavailable|Gateway Timeout)\((?<body>\{.*\})\)$') {
+            # az rest wraps the structured provider body in its HTTP reason.
+            # Require both the 404 reason and a known absence code; do not
+            # search arbitrary message text/identifiers for the digits 404.
+            $reason = $Matches.reason
+            $bodyText = $Matches.body
+            try {
+                $candidateCode = [string](($bodyText | ConvertFrom-Json -ErrorAction Stop).error.code)
+                if ($candidateCode -match '^[A-Za-z][A-Za-z0-9_.]{0,79}$') { $providerCode = $candidateCode }
+                $isNotFound = $reason -eq 'Not Found' -and $providerCode -in @('ResourceGroupNotFound', 'ResourceNotFound', 'Request_ResourceNotFound')
+            }
+            catch { $isNotFound = $false }
+        }
+        if ($NotFoundIsNull -and $isNotFound) { return $null }
         # Callers may handle this error without exposing a response body or an
         # argument containing credentials in a terminal/transcript.
-        $errorCode = if ($errorText -match '(?im)^\s*(?:ERROR:\s*)?\(([A-Za-z][A-Za-z0-9_.]+)\)') { " ($($Matches[1]))" } else { '' }
+        $errorCode = if ($providerCode) { " ($providerCode)" } else { '' }
         throw "Azure CLI command failed with exit code $exitCode$errorCode."
     }
     if (-not $text) { return $null }

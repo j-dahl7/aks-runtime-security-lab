@@ -21,6 +21,14 @@ $json = Invoke-AzJson -Arguments @('-NoProfile', '-CommandWithArgs', '$args[0] |
 if ($json -cne $argument) { throw 'Native argument boundaries changed.' }
 $missing = Invoke-AzJson -Arguments @('-NoProfile', '-Command', '[Console]::Error.WriteLine("ERROR: (ResourceNotFound) absent"); exit 3') -NotFoundIsNull
 if ($null -ne $missing) { throw 'Exact provider not-found code did not normalize to null.' }
+$missing = Invoke-AzJson -Arguments @('-NoProfile', '-Command', '[Console]::Error.WriteLine(''ERROR: Not Found({"error":{"code":"ResourceNotFound","message":"absent"}})''); exit 1') -NotFoundIsNull
+if ($null -ne $missing) { throw 'Structured az rest not-found response did not normalize to null.' }
+$refused = $false
+try {
+    Invoke-AzJson -Arguments @('-NoProfile', '-Command', '[Console]::Error.WriteLine(''ERROR: Forbidden({"error":{"code":"AuthorizationFailed","message":"404 ResourceNotFound"}})''); exit 1') -NotFoundIsNull
+}
+catch { $refused = $true }
+if (-not $refused) { throw 'Provider message text was mistaken for a not-found status.' }
 $caught = $null
 try {
     Invoke-AzJson -Arguments @('-NoProfile', '-Command', '[Console]::Error.WriteLine("ERROR: (AuthorizationFailed) tracking-aa404c-secret"); exit 1') -NotFoundIsNull
