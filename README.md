@@ -37,6 +37,9 @@ mocks without cloud credentials, deployment steps, or schedules.
 ## Prerequisites
 
 - Azure subscription with **Owner** or **Contributor + User Access Administrator** role
+- Tenant **Security Admin** or the higher role specified by Microsoft for
+  creating drift, antimalware, and gated-deployment security policies; Azure
+  resource deployment permissions alone do not grant this policy authority
 - [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli) v2.60+
 - [kubectl](https://kubernetes.io/docs/tasks/tools/) compatible with the
   exact Kubernetes version selected for this deployment
@@ -72,6 +75,12 @@ conflict with the existing Helm deployment. This lab uses standard AKS and the
 `mdc` namespace; AKS Automatic has separate `kube-system` requirements. Review
 [Microsoft's current Helm guidance](https://learn.microsoft.com/en-us/azure/defender-for-cloud/deploy-helm)
 before a live run.
+
+The node template currently selects Azure Linux 3. An AKS-supported node OS is
+not automatically a Defender-sensor-verified host OS. Check Microsoft's current
+sensor host-OS support list before deploying this combination; the offline
+tests do not establish sensor compatibility on it. This update does not silently
+replace the OS of an existing node pool.
 
 ## Quick Start
 
