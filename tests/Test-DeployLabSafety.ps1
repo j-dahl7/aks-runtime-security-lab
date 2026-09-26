@@ -29,7 +29,7 @@ function Assert-Condition {
 function New-MockPricingProperties {
     param([bool]$Configured)
     if (-not $Configured) {
-        return [pscustomobject]@{ pricingTier = 'Free'; extensions = @() }
+        return [pscustomobject]@{ pricingTier = 'Free'; enablementTime = $null; freeTrialRemainingTime = 'P30D' }
     }
     return [pscustomobject]@{
         pricingTier = 'Standard'
@@ -72,11 +72,30 @@ function Reset-MockState {
     $global:AksMockValuesFilePath = $null
     $global:AksMockValuesDirectory = $null
     $global:AksMockPricingProperties = New-MockPricingProperties -Configured $PricingConfigured
+    $global:AksMockLastPricingBody = $null
+    $global:AksMockAddServerExtension = $false
+    $global:AksMockPartialPricingFailure = $false
+    $global:AksMockPostWriteDrift = $false
+    $global:AksMockDriftDuringDeployment = $false
     $global:AksMockPolicyTemplateExists = $false
     $global:AksMockGroupDeleteShouldFail = $false
     $global:AksMockPricingPutShouldFail = $false
     $global:AksMockGroupExistsShouldFail = $false
     $global:AksMockCliSubscriptionId = $global:AksMockSubscriptionId
+}
+
+function Get-MockPricingResponse {
+    $properties = $global:AksMockPricingProperties | ConvertTo-Json -Depth 30 | ConvertFrom-Json
+    if ($properties.pricingTier -eq 'Standard') {
+        $properties | Add-Member NoteProperty enablementTime '2026-09-25T12:00:00Z' -Force
+        $properties | Add-Member NoteProperty freeTrialRemainingTime 'PT0S' -Force
+        $properties | Add-Member NoteProperty resourcesCoverageStatus 'FullyCovered' -Force
+        foreach ($extension in $properties.extensions) {
+            $code = if ($global:AksMockPartialPricingFailure -and $extension.name -eq 'ContainerSensor') { 'Failed' } else { 'Succeeded' }
+            $extension | Add-Member NoteProperty operationStatus ([pscustomobject]@{ code = $code; message = 'Mock provider result' }) -Force
+        }
+    }
+    return (@{ properties = $properties } | ConvertTo-Json -Depth 30 -Compress)
 }
 
 function Add-MockCall {
@@ -117,7 +136,7 @@ function global:az {
     if ($arguments[0] -eq 'group' -and $arguments[1] -eq 'show') {
         if (-not $global:AksMockResourceGroupExists) {
             $global:LASTEXITCODE = 3
-            return 'ResourceGroupNotFound'
+            return 'ERROR: (ResourceGroupNotFound) Mock group does not exist.'
         }
         return (@{
             id = $global:AksMockResourceGroupId
@@ -139,6 +158,7 @@ function global:az {
         if ($ownerArgument.Count -ne 1) { throw 'Bicep deployment did not receive one ownerToken parameter.' }
         $global:AksMockOwnerToken = $ownerArgument[0].Substring('ownerToken='.Length)
         $global:AksMockResourceGroupExists = $true
+        if ($global:AksMockDriftDuringDeployment) { $global:AksMockPricingProperties.pricingTier = 'Standard' }
         return (@{
             clusterName = @{ value = 'aks-runtime-lab' }
             workspaceId = @{ value = $global:AksMockWorkspaceResourceId }
@@ -149,13 +169,22 @@ function global:az {
         $urlIndex = [Array]::IndexOf($arguments, '--url')
         $url = if ($urlIndex -ge 0) { $arguments[$urlIndex + 1] } else { '' }
         if ($restMethod -eq 'GET' -and $url -match '/Microsoft.Security/pricings/Containers') {
-            return (@{ properties = $global:AksMockPricingProperties } | ConvertTo-Json -Depth 30 -Compress)
+            return Get-MockPricingResponse
         }
         if ($restMethod -eq 'PUT' -and $url -match '/Microsoft.Security/pricings/Containers') {
             if ($global:AksMockPricingPutShouldFail) { $global:LASTEXITCODE = 43; return 'simulated pricing failure' }
             $bodyIndex = [Array]::IndexOf($arguments, '--body')
-            $global:AksMockPricingProperties = ($arguments[$bodyIndex + 1] | ConvertFrom-Json).properties
-            return
+            $bodyArgument = $arguments[$bodyIndex + 1]
+            $global:AksMockLastPricingBody = if ($bodyArgument.StartsWith('@')) { Get-Content -LiteralPath $bodyArgument.Substring(1) -Raw } else { $bodyArgument }
+            $global:AksMockPricingProperties = ($global:AksMockLastPricingBody | ConvertFrom-Json).properties
+            if ($global:AksMockAddServerExtension -and $global:AksMockPricingProperties.pricingTier -eq 'Standard') {
+                $global:AksMockPricingProperties.extensions += [pscustomobject]@{ name = 'ProviderDefault'; isEnabled = 'False' }
+            }
+            $response = Get-MockPricingResponse
+            if ($global:AksMockPostWriteDrift -and $global:AksMockPricingProperties.pricingTier -eq 'Standard') {
+                $global:AksMockPricingProperties.extensions += [pscustomobject]@{ name = 'ConcurrentChange'; isEnabled = 'True' }
+            }
+            return $response
         }
         if ($restMethod -eq 'GET' -and $url -match '/alertRules\?') {
             return '{"value":[]}'
@@ -187,7 +216,7 @@ function global:az {
         }
         if ($restMethod -eq 'GET') {
             $global:LASTEXITCODE = 3
-            return 'ResourceNotFound'
+            return 'ERROR: (ResourceNotFound) Mock resource does not exist.'
         }
         if ($restMethod -eq 'PUT' -and $url -match '/alertRules/' -and $global:AksMockRulePutShouldFail) {
             $global:LASTEXITCODE = 42
@@ -309,6 +338,57 @@ try {
     Assert-Condition ($workbookSource -notmatch '"GatedDeployment"') 'Workbook still queries an undocumented gated-deployment alert type.'
     Assert-Condition ($analyticsSource -notmatch 'RequestURI !has "kube-system"') 'Interactive kube-system execution is still suppressed.'
     $null = $workbookSource | ConvertFrom-Json
+
+    Reset-MockState
+    $env:CONFIRM_SUBSCRIPTION_SCOPE = 'ENABLE-DEFENDER-FOR-CONTAINERS'
+    $global:AksMockAddServerExtension = $true
+    & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -SkipSentinel *> $null
+    $appliedState = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
+    Assert-Condition (@($appliedState.pricingApplied.extensions | Where-Object name -eq 'ProviderDefault').Count -eq 1) 'PUT response defaults were not recorded as applied state.'
+    Assert-Condition ($global:AksMockLastPricingBody -notmatch '\[null|enablementTime|operationStatus|freeTrialRemainingTime') 'Pricing PUT included null or response-only fields.'
+    & $DeployScript -Destroy *> $null
+    Assert-Condition ($global:AksMockPricingProperties.pricingTier -eq 'Free' -and -not (Test-Path -LiteralPath $StatePath)) 'Documented response metadata/defaults blocked cleanup.'
+
+    Reset-MockState
+    $global:AksMockPartialPricingFailure = $true
+    $partialError = $null
+    try { & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -SkipSentinel *> $null } catch { $partialError = $_ }
+    Assert-Condition ($partialError.Exception.Message -match 'did not report successful application') 'A failed extension status was accepted.'
+    Assert-Condition ($global:AksMockPricingProperties.pricingTier -eq 'Free') 'Known partial write was not rolled back to the captured state.'
+
+    Reset-MockState
+    $global:AksMockPostWriteDrift = $true
+    $driftError = $null
+    try { & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -SkipSentinel *> $null } catch { $driftError = $_ }
+    Assert-Condition ($driftError.Exception.Message -match 'shared setting changed') 'A post-write concurrent change was not detected.'
+    $pricingWrites = @($global:AksMockMutationCalls | Where-Object { $_ -match 'rest --method PUT.*pricings/Containers' })
+    Assert-Condition ($pricingWrites.Count -eq 1 -and $global:AksMockPricingProperties.pricingTier -eq 'Standard') 'Rollback overwrote concurrent pricing.'
+    Assert-Condition (Test-Path -LiteralPath $StatePath) 'Concurrent pricing discarded the recovery manifest.'
+
+    Reset-MockState
+    $global:AksMockDriftDuringDeployment = $true
+    $driftError = $null
+    try { & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -SkipSentinel *> $null } catch { $driftError = $_ }
+    Assert-Condition ($driftError.Exception.Message -match 'changed during infrastructure deployment') 'Pricing was not rechecked immediately before writing.'
+    Assert-Condition (@($global:AksMockMutationCalls | Where-Object { $_ -match 'rest --method PUT.*pricings/Containers' }).Count -eq 0) 'A pricing change during deployment was overwritten.'
+
+    Reset-MockState
+    & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -SkipSentinel *> $null
+    $legacyState = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
+    $legacyState.PSObject.Properties.Remove('pricingApplied')
+    $legacyState.pricingDesired.extensions = @($null) + @($legacyState.pricingDesired.extensions)
+    $legacyState | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $StatePath
+    & $DeployScript -Destroy *> $null
+    Assert-Condition ($global:AksMockPricingProperties.pricingTier -eq 'Free') 'Legacy normalized exact desired state was not recoverable.'
+
+    foreach ($unknownLevel in @('top', 'extension')) {
+        Reset-MockState -PricingConfigured $true
+        if ($unknownLevel -eq 'top') { $global:AksMockPricingProperties | Add-Member NoteProperty futureSetting 'unknown' }
+        else { $global:AksMockPricingProperties.extensions[0] | Add-Member NoteProperty futureSetting 'unknown' }
+        $unknownError = $null
+        try { & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -SkipSentinel *> $null } catch { $unknownError = $_ }
+        Assert-Condition ($null -ne $unknownError -and $global:AksMockMutationCalls.Count -eq 0) "Unknown $unknownLevel pricing data allowed mutations."
+    }
 
     Reset-MockState -PricingConfigured $true
     $rangeError = $null

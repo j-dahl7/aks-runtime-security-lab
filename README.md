@@ -275,7 +275,23 @@ the current protection and retry manifest. Pricing restore is rechecked for
 concurrent changes and verified before the manifest is removed. A retry accepts
 the exact already-restored before-state, so a failed restore or interrupted
 final manifest removal can be completed without another group deletion. Other
-shared-setting drift fails closed; it is never overwritten.
+detected shared-setting drift fails closed. These are compare-before-write checks,
+not an atomic lock against another subscription administrator.
+
+Pricing comparisons exclude documented server-only fields such as
+`enablementTime` and extension `operationStatus`. Deployment verifies the
+requested writable values and extension results, then records the writable
+state returned by the pricing PUT as `pricingApplied`. Later reads must match
+that snapshot before automatic rollback or cleanup can replace shared settings.
+Unknown fields, failed reads, and ambiguous writes retain the manifest for
+operator review. Old manifests without `pricingApplied` are recoverable only
+when current normalized pricing exactly matches their captured before-state or
+requested state; extra writable settings are not silently adopted. In
+particular, do not delete a manifest or edit it to match current pricing merely
+to bypass a drift refusal.
+
+The response-shape and failure-recovery tests are offline mocks; they do not
+establish a fresh Azure deployment or billing outcome.
 
 ## Resources
 

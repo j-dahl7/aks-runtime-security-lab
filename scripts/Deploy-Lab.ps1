@@ -108,14 +108,59 @@ function Invoke-AzJson {
         [switch]$NotFoundIsNull
     )
 
-    $output = & az @Arguments 2>&1
-    $exitCode = $LASTEXITCODE
-    $text = ($output | Out-String).Trim()
+    $command = Get-Command az -ErrorAction Stop
+    if ($command.CommandType -in @('Function', 'Filter')) {
+        # Preserve the offline harness contract while keeping its error stream
+        # separate from JSON, just like the native-process path below.
+        $errors = [System.Collections.Generic.List[string]]::new()
+        $output = @(& az @Arguments 2>&1 | ForEach-Object {
+            if ($_ -is [System.Management.Automation.ErrorRecord]) { $errors.Add([string]$_) }
+            else { $_ }
+        })
+        $exitCode = $LASTEXITCODE
+        $stderr = $errors -join "`n"
+        $text = ($output | Out-String).Trim()
+    }
+    else {
+        $start = [System.Diagnostics.ProcessStartInfo]::new()
+        $start.FileName = $command.Source
+        if ([System.IO.Path]::GetExtension($start.FileName) -in @('.cmd', '.bat')) {
+            # The Windows MSI wrapper expands %* through cmd.exe. Invoke its
+            # bundled Python directly so URLs/JSON remain individual arguments.
+            $python = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $command.Source) '../python.exe'))
+            if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
+                throw 'The Azure CLI batch wrapper has no adjacent bundled python.exe; use a supported native Azure CLI installation.'
+            }
+            $start.FileName = $python
+            foreach ($argument in @('-IBm', 'azure.cli')) { $start.ArgumentList.Add($argument) }
+        }
+        foreach ($argument in $Arguments) { $start.ArgumentList.Add($argument) }
+        $start.UseShellExecute = $false
+        $start.CreateNoWindow = $true
+        $start.RedirectStandardOutput = $true
+        $start.RedirectStandardError = $true
+        $process = [System.Diagnostics.Process]::new()
+        $process.StartInfo = $start
+        try {
+            if (-not $process.Start()) { throw 'Could not start Azure CLI.' }
+            $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+            $stderrTask = $process.StandardError.ReadToEndAsync()
+            $process.WaitForExit()
+            $text = $stdoutTask.GetAwaiter().GetResult().Trim()
+            $stderr = $stderrTask.GetAwaiter().GetResult().Trim()
+            $exitCode = $process.ExitCode
+        }
+        finally { $process.Dispose() }
+    }
     if ($exitCode -ne 0) {
-        if ($NotFoundIsNull -and $text -match '(?i)(ResourceGroupNotFound|ResourceNotFound|not found|could not be found|status code.?404|HTTP 404)') {
+        $errorText = "$stderr`n$text"
+        if ($NotFoundIsNull -and $errorText -match '(?im)^\s*(?:ERROR:\s*)?\((?:ResourceGroupNotFound|ResourceNotFound)\)') {
             return $null
         }
-        throw "Azure CLI command failed: $text"
+        # Callers may handle this error without exposing a response body or an
+        # argument containing credentials in a terminal/transcript.
+        $errorCode = if ($errorText -match '(?im)^\s*(?:ERROR:\s*)?\(([A-Za-z][A-Za-z0-9_.]+)\)') { " ($($Matches[1]))" } else { '' }
+        throw "Azure CLI command failed with exit code $exitCode$errorCode."
     }
     if (-not $text) { return $null }
     return $text | ConvertFrom-Json
@@ -235,7 +280,7 @@ function Get-WritablePricingProperties {
     param([Parameter(Mandatory)]$Properties)
 
     $writable = @('pricingTier', 'subPlan', 'enforce', 'extensions', 'securityOperatorResourceId')
-    $readOnly = @('freeTrialRemainingTime', 'inherited', 'inheritedFrom', 'resourcesCoverageStatus', 'deprecated', 'replacedBy')
+    $readOnly = @('enablementTime', 'freeTrialRemainingTime', 'inherited', 'inheritedFrom', 'resourcesCoverageStatus', 'deprecated', 'replacedBy')
     $unknown = @($Properties.PSObject.Properties.Name | Where-Object { $_ -notin $writable -and $_ -notin $readOnly })
     if ($unknown.Count -gt 0) {
         throw "Defender pricing contains unrecognized properties that this lab will not risk dropping: $($unknown -join ', ')"
@@ -245,7 +290,30 @@ function Get-WritablePricingProperties {
     foreach ($name in $writable) {
         $property = $Properties.PSObject.Properties[$name]
         if ($property -and $null -ne $property.Value) {
-            $result[$name] = $property.Value
+            if ($name -ne 'extensions') {
+                $result[$name] = $property.Value
+                continue
+            }
+            $extensions = @($property.Value | Where-Object { $null -ne $_ } | ForEach-Object {
+                $extension = $_
+                $unknownExtension = @($extension.PSObject.Properties.Name | Where-Object {
+                    $_ -notin @('name', 'isEnabled', 'additionalExtensionProperties', 'operationStatus')
+                })
+                if ($unknownExtension.Count -or -not $extension.name -or [string]$extension.isEnabled -notmatch '^(?i:true|false)$') {
+                    throw 'Defender pricing contains an invalid extension or unrecognized extension properties.'
+                }
+                # operationStatus is response-only. Never fingerprint it or
+                # include it in a restore body. Empty collections normalize away.
+                $copy = [ordered]@{ name = [string]$extension.name; isEnabled = if ([string]$extension.isEnabled -ieq 'true') { 'True' } else { 'False' } }
+                if ($null -ne $extension.additionalExtensionProperties -and @($extension.additionalExtensionProperties.PSObject.Properties).Count) {
+                    $copy.additionalExtensionProperties = $extension.additionalExtensionProperties
+                }
+                [pscustomobject]$copy
+            })
+            if (@($extensions | Group-Object name | Where-Object Count -gt 1).Count) {
+                throw 'Defender pricing contains duplicate extensions.'
+            }
+            if ($extensions.Count) { $result.extensions = $extensions }
         }
     }
     if (-not $result.Contains('pricingTier')) {
@@ -259,7 +327,7 @@ function New-DesiredPricingProperties {
 
     $desired = Get-WritablePricingProperties $CurrentProperties
     $desired.pricingTier = 'Standard'
-    $extensions = @($desired.extensions)
+    $extensions = @($desired.extensions | Where-Object { $null -ne $_ })
     $duplicateNames = @($extensions | Group-Object name | Where-Object Count -gt 1)
     if ($duplicateNames.Count -gt 0) {
         throw "Defender pricing contains duplicate extensions: $($duplicateNames.Name -join ', ')"
@@ -330,9 +398,46 @@ function Set-PricingProperties {
         [Parameter(Mandatory)]$Properties,
         [Parameter(Mandatory)][string]$Action
     )
-    $body = @{ properties = $Properties } | ConvertTo-Json -Depth 30 -Compress
-    az rest --method PUT --url $Url --body $body --headers 'Content-Type=application/json' --output none 2>$null
-    Assert-LastExitCode -Action $Action
+    $body = @{ properties = (Get-WritablePricingProperties $Properties) } | ConvertTo-Json -Depth 30 -Compress
+    $bodyFile = [System.IO.Path]::GetTempFileName()
+    try {
+        [System.IO.File]::WriteAllText($bodyFile, $body, [System.Text.UTF8Encoding]::new($false))
+        $response = Invoke-AzJson -Arguments @('rest', '--method', 'PUT', '--url', $Url, '--body', "@$bodyFile", '--headers', 'Content-Type=application/json', '--only-show-errors', '--output', 'json')
+        if (-not $response.properties) { throw "$Action did not return the applied pricing properties; manifest retained." }
+        return $response.properties
+    }
+    finally { Remove-Item -LiteralPath $bodyFile -Force -ErrorAction SilentlyContinue }
+}
+
+function Assert-DesiredPricingApplied {
+    param([Parameter(Mandatory)]$Actual, [Parameter(Mandatory)]$Desired)
+    $normalized = Get-WritablePricingProperties $Actual
+    foreach ($property in $Desired.PSObject.Properties | Where-Object Name -ne 'extensions') {
+        if ((ConvertTo-CanonicalValue $normalized.($property.Name) | ConvertTo-Json -Depth 30 -Compress) -cne
+            (ConvertTo-CanonicalValue $property.Value | ConvertTo-Json -Depth 30 -Compress)) {
+            throw "Defender pricing did not persist requested property '$($property.Name)'."
+        }
+    }
+    foreach ($expected in @($Desired.extensions | Where-Object { $null -ne $_ })) {
+        $actualExtension = @($normalized.extensions | Where-Object name -eq $expected.name)
+        if ($actualExtension.Count -ne 1 -or
+            (ConvertTo-CanonicalValue $actualExtension[0] | ConvertTo-Json -Depth 30 -Compress) -cne
+            (ConvertTo-CanonicalValue $expected | ConvertTo-Json -Depth 30 -Compress)) {
+            throw "Defender pricing did not persist requested extension '$($expected.name)'."
+        }
+        $raw = @($Actual.extensions | Where-Object name -eq $expected.name)[0]
+        if ($raw.operationStatus -and $raw.operationStatus.code -ne 'Succeeded') {
+            throw "Defender pricing extension '$($expected.name)' did not report successful application."
+        }
+    }
+}
+
+function Get-AppliedPricingState {
+    param([Parameter(Mandatory)]$State)
+    # Old manifests can be recovered only when the normalized requested state
+    # matches exactly. Never adopt an arbitrary current shared configuration.
+    if ($State.pricingApplied) { return $State.pricingApplied }
+    return $State.pricingDesired
 }
 
 function Restore-PricingIfUnchanged {
@@ -342,10 +447,11 @@ function Restore-PricingIfUnchanged {
     )
 
     $current = Invoke-AzJson -Arguments @('rest', '--method', 'GET', '--url', $Context.url, '--only-show-errors', '--output', 'json')
+    if ((Get-PricingFingerprint $current.properties) -eq (Get-PricingFingerprint $Context.before)) { return }
     if ((Get-PricingFingerprint $current.properties) -ne (Get-PricingFingerprint $Context.desired)) {
         throw "Refusing to restore Defender pricing after $Reason because the shared setting changed after this lab wrote it."
     }
-    Set-PricingProperties -Url $Context.url -Properties $Context.before -Action "Defender pricing restore after $Reason"
+    $null = Set-PricingProperties -Url $Context.url -Properties $Context.before -Action "Defender pricing restore after $Reason"
 }
 
 trap {
@@ -642,7 +748,7 @@ if ($Destroy) {
     if ([bool]$state.pricingChanged) {
         $pricingCurrent = Invoke-AzJson -Arguments @('rest', '--method', 'GET', '--url', $pricingUrl, '--only-show-errors', '--output', 'json')
         $pricingAlreadyRestored = (Get-PricingFingerprint $pricingCurrent.properties) -eq (Get-PricingFingerprint $state.pricingBefore)
-        if (-not $pricingAlreadyRestored -and (Get-PricingFingerprint $pricingCurrent.properties) -ne (Get-PricingFingerprint $state.pricingDesired)) {
+        if (-not $pricingAlreadyRestored -and (Get-PricingFingerprint $pricingCurrent.properties) -ne (Get-PricingFingerprint (Get-AppliedPricingState $state))) {
             throw 'Refusing cleanup because the shared Defender pricing setting changed after this lab configured it.'
         }
     }
@@ -661,9 +767,9 @@ if ($Destroy) {
         # makes a failed restore (or a prior successful restore) safely resumable.
         if ([bool]$state.pricingChanged -and -not $pricingAlreadyRestored) {
             $pricingLatest = Invoke-AzJson -Arguments @('rest', '--method', 'GET', '--url', $pricingUrl, '--only-show-errors', '--output', 'json')
-            if ((Get-PricingFingerprint $pricingLatest.properties) -ne (Get-PricingFingerprint $state.pricingDesired)) { throw 'Shared pricing changed during deletion; manifest retained and pricing not overwritten.' }
+            if ((Get-PricingFingerprint $pricingLatest.properties) -ne (Get-PricingFingerprint (Get-AppliedPricingState $state))) { throw 'Shared pricing changed during deletion; manifest retained and pricing not overwritten.' }
             if (-not $PSCmdlet.ShouldProcess('Defender for Containers pricing', 'Restore captured pre-lab shared setting after verified deletion')) { return }
-            Set-PricingProperties -Url $pricingUrl -Properties $state.pricingBefore -Action 'Defender for Containers pricing restore'
+            $null = Set-PricingProperties -Url $pricingUrl -Properties $state.pricingBefore -Action 'Defender for Containers pricing restore'
             $restored = Invoke-AzJson -Arguments @('rest', '--method', 'GET', '--url', $pricingUrl, '--only-show-errors', '--output', 'json')
             if ((Get-PricingFingerprint $restored.properties) -ne (Get-PricingFingerprint $state.pricingBefore)) { throw 'Shared pricing restore was not verified; manifest retained.' }
         }
@@ -698,7 +804,7 @@ if ($state) {
     $desiredPricing = $state.pricingDesired
     $currentFingerprint = Get-PricingFingerprint $currentPricing
     $beforeFingerprint = Get-PricingFingerprint $pricingBefore
-    $desiredFingerprint = Get-PricingFingerprint $desiredPricing
+    $desiredFingerprint = Get-PricingFingerprint (Get-AppliedPricingState $state)
     if ($currentFingerprint -ne $beforeFingerprint -and $currentFingerprint -ne $desiredFingerprint) {
         throw 'Shared Defender pricing drifted from both the captured before-state and this lab desired-state.'
     }
@@ -807,15 +913,28 @@ if ($PSCmdlet.ShouldProcess("Subscription", "Deploy Bicep template")) {
 Write-Host "`n[3/7] Enabling Defender for Containers plan..." -ForegroundColor Yellow
 
 if ($defenderPlanNeedsUpdate -and $PSCmdlet.ShouldProcess("Subscription", "Enable Defender for Containers")) {
+    $latestPricing = Invoke-AzJson -Arguments @('rest', '--method', 'GET', '--url', $pricingUrl, '--only-show-errors', '--output', 'json')
+    if ((Get-PricingFingerprint $latestPricing.properties) -ne (Get-PricingFingerprint $currentPricing)) {
+        throw 'Shared Defender pricing changed during infrastructure deployment; no pricing write was attempted.'
+    }
     $script:PricingRollbackContext = [pscustomobject]@{
         url = $pricingUrl
         before = $pricingBefore
         desired = $desiredPricing
     }
-    Set-PricingProperties -Url $pricingUrl -Properties $desiredPricing -Action 'Defender for Containers configuration'
+    $appliedResponse = Set-PricingProperties -Url $pricingUrl -Properties $desiredPricing -Action 'Defender for Containers configuration'
+    # Bind rollback/drift checks to the PUT response, not a later GET that may
+    # contain another operator's change. This is best-effort compare-before-write;
+    # the pricing API does not expose a conditional-write token in this contract.
+    $appliedPricing = Get-WritablePricingProperties $appliedResponse
+    $script:PricingRollbackContext.desired = $appliedPricing
+    if ($state -is [System.Collections.IDictionary]) { $state.pricingApplied = $appliedPricing }
+    else { $state | Add-Member -MemberType NoteProperty -Name pricingApplied -Value $appliedPricing -Force }
+    Write-LabState $state
+    Assert-DesiredPricingApplied -Actual $appliedResponse -Desired $desiredPricing
     $writtenPricing = Invoke-AzJson -Arguments @('rest', '--method', 'GET', '--url', $pricingUrl, '--only-show-errors', '--output', 'json')
-    if ((Get-PricingFingerprint $writtenPricing.properties) -ne (Get-PricingFingerprint $desiredPricing)) {
-        throw 'Defender for Containers did not persist the exact merged desired state.'
+    if ((Get-PricingFingerprint $writtenPricing.properties) -ne (Get-PricingFingerprint $appliedPricing)) {
+        throw 'Defender for Containers changed after the pricing write; manifest retained and shared state will not be overwritten.'
     }
 
     Write-Host "  Defender for Containers: Enabled (with AntiMalware)" -ForegroundColor Green
