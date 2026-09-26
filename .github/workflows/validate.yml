@@ -37,3 +37,4 @@ jobs:
         run: |
           ./tests/Test-DeployLabSafety.ps1
           ./tests/Test-RuntimeSafety.ps1
+          ./tests/Test-AzJson.ps1

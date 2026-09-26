@@ -1,4 +1,4 @@
-#Requires -Version 7.4
+#Requires -Version 7.6
 
 <#
 .SYNOPSIS
@@ -6,9 +6,9 @@
 
 .DESCRIPTION
     Exercises three runtime-security scenarios:
-    1. Binary drift - drops and executes a script not in the original image
+    1. Binary drift - copies and executes an ELF binary in the writable layer
     2. Anti-malware - writes and attempts to execute the EICAR test file
-    3. Gated deployment - attempts Microsoft's documented test image
+    3. Gated deployment - attempts the reviewed image supplied by the operator
 
     Results depend on enabled policies, sensor health, telemetry ingestion, and
     service-side processing. Gated-deployment decisions are reviewed in
@@ -30,6 +30,11 @@
 .PARAMETER SkipGated
     Skip the gated deployment test.
 
+.PARAMETER GatedTestImage
+    Image from a supported registry with reviewed, signed vulnerability findings.
+    The default is an image shown in Microsoft's sample denial message; it is
+    not a guaranteed test fixture for this subscription or policy.
+
 .EXAMPLE
     ./Test-RuntimeSecurity.ps1
     Run all test scenarios.
@@ -43,7 +48,10 @@ param(
     [string]$Namespace = 'runtime-security-tests',
     [switch]$SkipDrift,
     [switch]$SkipMalware,
-    [switch]$SkipGated
+    [switch]$SkipGated,
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9./:_@-]+$')]
+    [ValidateLength(1, 512)]
+    [string]$GatedTestImage = 'mcr.microsoft.com/mdc/dev/defender-admission-controller/test-images:one-high'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -109,25 +117,19 @@ function New-OwnedTestPod {
 Write-Host "Verified immutable cluster identity; test namespace: $Namespace; run: $runId`n"
 
 # ---------- Test 1: Binary Drift ----------
+# Reviewed Docker Hub multi-platform index digest, 2026-09-25. Refresh by
+# checking the official library/nginx tag metadata and reviewing the image.
+$testImage = 'nginx:1.30-alpine@sha256:985220252f3863977e468f611ef118ebd01421289dd86ee1ae99cb068c3bce2b'
 if (-not $SkipDrift) {
     Write-Host "[Test 1/3] Binary Drift Detection" -ForegroundColor Yellow
     Write-Host "  Deploying clean nginx container..."
 
     $driftPod = "drift-test-$runId"
-    New-OwnedTestPod $driftPod 'nginx:1.27-alpine'
+    New-OwnedTestPod $driftPod $testImage
 
-    Write-Host "  Introducing binary drift (creating + executing script not in image)..."
+    Write-Host "  Introducing binary drift (copying + executing an ELF in the writable layer)..."
     Assert-OwnedTestPod $driftPod
-    kubectl --context $context exec $driftPod -n $Namespace -- /bin/sh -c @"
-cat > /tmp/drift-binary.sh << 'SCRIPT'
-#!/bin/sh
-echo 'This binary is not part of the original image'
-hostname
-whoami
-SCRIPT
-chmod +x /tmp/drift-binary.sh
-/tmp/drift-binary.sh
-"@
+    kubectl --context $context exec $driftPod -n $Namespace -- /bin/sh -c 'mkdir /tmp/nlzt-drift && cp /bin/busybox /tmp/nlzt-drift/busybox && chmod +x /tmp/nlzt-drift/busybox && /tmp/nlzt-drift/busybox true'
     if ($LASTEXITCODE -ne 0) { throw 'Binary drift command failed; review the actual control evidence.' }
 
     Write-Host "  Binary drift activity submitted." -ForegroundColor Green
@@ -141,7 +143,7 @@ if (-not $SkipMalware) {
     Write-Host "  Deploying clean nginx container..."
 
     $malwarePod = "malware-test-$runId"
-    New-OwnedTestPod $malwarePod 'nginx:1.27-alpine'
+    New-OwnedTestPod $malwarePod $testImage
 
     Write-Host "  Writing EICAR test file into container..."
     # EICAR test string (base64-encoded to avoid shell escaping issues)
@@ -170,10 +172,10 @@ if (-not $SkipMalware) {
 
 # ---------- Test 3: Gated Deployment ----------
 if (-not $SkipGated) {
-    Write-Host "[Test 3/3] Gated Deployment (Microsoft Test Image)" -ForegroundColor Yellow
-    $gatedTestImage = 'mcr.microsoft.com/mdc/dev/defender-admission-controller/test-images:one-high'
-    Write-Host "  Attempting Microsoft's documented gated-deployment test image:"
-    Write-Host "  $gatedTestImage"
+    Write-Host "[Test 3/3] Gated Deployment (Reviewed Image)" -ForegroundColor Yellow
+    Write-Host "  Attempting image: $GatedTestImage"
+    Write-Host "  Confirm this image has signed findings in a supported registry and matches the rule scope."
+    Write-Host "  The default MCR sample does not guarantee a denial or vulnerability finding."
 
     $gatedPod = "vuln-test-$runId"
 
@@ -220,9 +222,9 @@ Selected scenarios were attempted. Review each control in its documented surface
   5. Runtime-alert KQL in Log Analytics:
      SecurityAlert
      | where TimeGenerated > ago(1h)
-     | where ProductName == "Microsoft Defender for Cloud"
-     | where AlertType has_any ("DriftDetection", "BinaryDrift", "MalwareDetected")
-     | project TimeGenerated, AlertName, AlertSeverity, Description
+     | where ProductName in~ ("Azure Security Center", "Microsoft Defender for Cloud")
+     | where AlertType has_any ("DriftDetection", "BinaryDrift", "MalwareDetected") or AlertName has_any ("drift", "malware")
+     | project TimeGenerated, ProductName, AlertName, AlertSeverity, Description
 
 Cleanup test pods:
   Review this run's pods before manual cleanup:

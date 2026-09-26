@@ -12,7 +12,7 @@ Companion lab for the blog post: [AKS Runtime Security: Binary Drift, Anti-Malwa
 
 ## Validation Boundary
 
-The August 13, 2026 source-audited revision was validated with Bicep compilation,
+The September 25, 2026 repair revision was checked with Bicep compilation,
 PowerShell parsing, and mocked safety/rollback tests. It was not freshly
 deployed to Azure, and no live AKS, Defender, Helm, Sentinel, or alert-ingestion
 validation was performed for this revision. Feature availability, policy
@@ -23,6 +23,8 @@ Run the offline deployment-safety harness from a fresh checkout:
 
 ```powershell
 pwsh -NoProfile -File tests/Test-DeployLabSafety.ps1
+pwsh -NoProfile -File tests/Test-RuntimeSafety.ps1
+pwsh -NoProfile -File tests/Test-AzJson.ps1
 ```
 
 It mocks Azure CLI, Kubernetes, and Helm to exercise ownership refusal, exact
@@ -35,25 +37,34 @@ mocks without cloud credentials, deployment steps, or schedules.
 ## Prerequisites
 
 - Azure subscription with **Owner** or **Contributor + User Access Administrator** role
+- Tenant **Security Admin** or the higher role specified by Microsoft for
+  creating drift, antimalware, and gated-deployment security policies; Azure
+  resource deployment permissions alone do not grant this policy authority
 - [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli) v2.60+
 - [kubectl](https://kubernetes.io/docs/tasks/tools/) compatible with the
-  bundled AKS Kubernetes 1.35 deployment
-- [Helm](https://helm.sh/docs/intro/install/) v3.12+
-- [PowerShell 7.4 or later](https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell) (enforced before either entry point runs; required for the supported .NET APIs)
+  exact Kubernetes version selected for this deployment
+- [Helm](https://helm.sh/docs/intro/install/) 4 recommended; supported Helm 3 releases remain compatible until their security-support end on February 10, 2027
+- [PowerShell 7.6 LTS or later](https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell) (enforced before either entry point runs; required for the supported .NET APIs)
 
 This lab can enable or change the paid Defender for Containers plan and its
 extensions at subscription scope. If the required state is not already active,
 the real deployment requires the exact environment confirmation
 `CONFIRM_SUBSCRIPTION_SCOPE=ENABLE-DEFENDER-FOR-CONTAINERS`.
 
-The script pins Defender's OCI Helm chart to `0.11.4` because that is the
-bundle-tested version. It is not a claim that `0.11.4` is the newest release or
+The script pins Defender's OCI Helm chart to `0.11.5` after reviewing its published chart and August security fixes.
+It is not a claim that `0.11.5` is the newest release or
 compatible with every future AKS/Defender combination. Before a live run,
 confirm that the publisher still serves the pin and review its supported
 Kubernetes/Defender matrix:
 
+The retained `0.11.5` archive was checked against OCI layer digest
+`sha256:30a95ffed15dcd07b5789bb53c8ab6ae4f93946e16beee075375ecf7c8f08c9a`;
+its helpers explicitly make workspace ID/key optional. Microsoft's current
+changelog also lists sensor `0.11.6`; this review could not refresh MCR's tag
+listing, so no unverified chart tag or fresh sensor deployment is claimed.
+
 ```powershell
-helm show chart oci://mcr.microsoft.com/azuredefender/microsoft-defender-for-containers --version 0.11.4
+helm show chart oci://mcr.microsoft.com/azuredefender/microsoft-defender-for-containers --version 0.11.5
 ```
 
 A Helm-managed sensor is not upgraded automatically; the operator owns chart
@@ -64,6 +75,12 @@ conflict with the existing Helm deployment. This lab uses standard AKS and the
 `mdc` namespace; AKS Automatic has separate `kube-system` requirements. Review
 [Microsoft's current Helm guidance](https://learn.microsoft.com/en-us/azure/defender-for-cloud/deploy-helm)
 before a live run.
+
+The node template currently selects Azure Linux 3. An AKS-supported node OS is
+not automatically a Defender-sensor-verified host OS. Check Microsoft's current
+sensor host-OS support list before deploying this combination; the offline
+tests do not establish sensor compatibility on it. This update does not silently
+replace the OS of an existing node pool.
 
 ## Quick Start
 
@@ -98,10 +115,14 @@ $env:CONFIRM_SUBSCRIPTION_SCOPE = 'ENABLE-DEFENDER-FOR-CONTAINERS'
 
 The confirmation authorizes a live subscription-level change; it is not a
 preview. A real deployment also updates kubeconfig, writes cluster resources,
-and briefly materializes an owner-only Helm values file containing the
-workspace key. The script removes that file after success or failure, uses
-Helm `--atomic`, and attempts to restore the prior cluster Defender/profile-tag
-state if the chart deployment fails.
+and briefly materializes an owner-only Helm values file containing cloud
+identifiers and sensor options. No Log Analytics shared key is retrieved or
+passed to Helm. The script removes the file after success or failure and uses
+Helm 3 `--atomic` or Helm 4 `--rollback-on-failure`. It attempts to restore the
+prior cluster Defender/profile-tag state if chart deployment fails. Old Helm
+release history may still contain credentials from previous lab versions;
+review retained release records as part of operator cleanup. Workspace local
+(shared-key) authentication is disabled by the current template.
 
 First deployment requires 1-20 explicit public operator-egress IPv4 CIDRs, each
 /24 through /32; broad, private, documentation, benchmark, protocol-assignment,
@@ -148,7 +169,7 @@ The local manifest is trusted operator state, not a tamper-proof attestation.
 Gated deployment requires Kubernetes 1.31 or later, OIDC on AKS, Defender
 sensor with Security Gating, Registry access with Security findings, and
 vulnerability findings artifacts for evaluated images. The lab deploys AKS
-1.35 with OIDC, but you must verify every service-side prerequisite and artifact
+a supported GA version with OIDC, but you must verify every service-side prerequisite and artifact
 before attributing an allow/deny result to a policy.
 
 ## What Gets Deployed
@@ -156,7 +177,7 @@ before attributing an allow/deny result to a policy.
 | Resource | Type | Purpose |
 |---|---|---|
 | `aks-runtime-lab` | AKS Cluster | Single-node cluster (Standard_D4s_v3) |
-| Defender Sensor | Helm Chart | Bundle-tested pin `0.11.4` with anti-malware collector (`mdc` namespace) |
+| Defender Sensor | Helm Chart | Source-reviewed pin `0.11.5` with anti-malware collector (`mdc` namespace) |
 | `aks-runtime-lab-law` | Log Analytics | Container Insights + Microsoft Sentinel |
 | Defender for Containers | Security Plan | Subscription-level enablement |
 | 3 Analytics Rules | Sentinel | Binary drift, malware, kubectl exec |
@@ -165,28 +186,39 @@ before attributing an allow/deny result to a policy.
 ## Repository Structure
 
 ```
-├── bicep/
-│   ├── main.bicep                  # Subscription-scoped orchestrator
-│   └── modules/
-│       ├── aks.bicep               # AKS cluster + diagnostics (sensor via Helm)
-│       └── monitoring.bicep        # Log Analytics + Sentinel + Container Insights
-├── detection/
-│   ├── analytics-rules.kql         # 3 Sentinel analytics rules
-│   └── hunting-queries.kql         # 3 proactive hunting queries
-├── scripts/
-│   ├── Deploy-Lab.ps1              # One-command deployment
-│   └── Test-RuntimeSecurity.ps1    # 3 test scenarios
-├── tests/
-│   └── Test-DeployLabSafety.ps1    # Offline Azure/Kubernetes/Helm safety mocks
-└── workbook/
-    └── container-runtime-workbook.json  # Container Runtime Security Dashboard
+â”œâ”€â”€ bicep/
+â”‚   â”œâ”€â”€ main.bicep                  # Subscription-scoped orchestrator
+â”‚   â””â”€â”€ modules/
+â”‚       â”œâ”€â”€ aks.bicep               # AKS cluster + diagnostics (sensor via Helm)
+â”‚       â””â”€â”€ monitoring.bicep        # Log Analytics + Sentinel + Container Insights
+â”œâ”€â”€ detection/
+â”‚   â”œâ”€â”€ analytics-rules.kql         # 3 Sentinel analytics rules
+â”‚   â””â”€â”€ hunting-queries.kql         # 3 proactive hunting queries
+â”œâ”€â”€ scripts/
+â”‚   â”œâ”€â”€ Deploy-Lab.ps1              # One-command deployment
+â”‚   â””â”€â”€ Test-RuntimeSecurity.ps1    # 3 test scenarios
+â”œâ”€â”€ tests/
+â”‚   â””â”€â”€ Test-DeployLabSafety.ps1    # Offline Azure/Kubernetes/Helm safety mocks
+â””â”€â”€ workbook/
+    â””â”€â”€ container-runtime-workbook.json  # Container Runtime Security Dashboard
 ```
+
+First deployment resolves an exact patch from the region's default GA AKS
+version, or validates an explicit `-KubernetesVersion` against regional GA
+availability. New deployments require at least 1.32 for this template's Azure
+Linux 3 selection (the gated feature itself requires 1.31). The exact version is recorded in the
+manifest and reused on reruns; a changing regional default never upgrades an
+owned cluster. Older manifests use the live cluster's exact version. Plan
+cluster upgrades separately before that version leaves support.
 
 ## Test Scenarios
 
 ### Test 1: Binary Drift
 
-Drops and executes a script not present in the original container image.
+Copies the existing BusyBox ELF to a new path in the writable container layer
+and executes its harmless `true` applet. Running a newly written shell script
+alone can execute only the in-image interpreter and is not equivalent evidence.
+Drift and malware pods use a reviewed nginx 1.30-alpine image index digest.
 
 ```powershell
 ./scripts/Test-RuntimeSecurity.ps1 -SkipMalware -SkipGated
@@ -213,9 +245,11 @@ delivery has variable latency.
 
 ### Test 3: Gated Deployment
 
-Attempts Microsoft's test image shown in its gated-deployment troubleshooting
-documentation. This avoids assuming that an arbitrary old image tag still maps
-to current vulnerability findings.
+The default image is shown in Microsoft's sample denial message; Microsoft
+does not promise it is a test fixture for your subscription. For a controlled
+validation, pass `-GatedTestImage` with a reviewed image in a supported registry
+that has registry access/security findings enabled. Confirm the signed findings
+artifact and matching policy scope before interpreting the admission result.
 
 ```powershell
 ./scripts/Test-RuntimeSecurity.ps1 -SkipDrift -SkipMalware
@@ -275,7 +309,57 @@ the current protection and retry manifest. Pricing restore is rechecked for
 concurrent changes and verified before the manifest is removed. A retry accepts
 the exact already-restored before-state, so a failed restore or interrupted
 final manifest removal can be completed without another group deletion. Other
-shared-setting drift fails closed; it is never overwritten.
+detected shared-setting drift fails closed. These are compare-before-write checks,
+not an atomic lock against another subscription administrator.
+
+Pricing comparisons exclude documented server-only fields such as
+`enablementTime` and extension `operationStatus`. Deployment verifies the
+requested writable values and extension results, then records the writable
+state returned by the pricing PUT as `pricingApplied`. Later reads must match
+that snapshot before automatic rollback or cleanup can replace shared settings.
+Unknown fields, failed reads, and ambiguous writes retain the manifest for
+operator review. Old manifests without `pricingApplied` are recoverable only
+when current normalized pricing exactly matches their captured before-state or
+requested state; extra writable settings are not silently adopted. In
+particular, do not delete a manifest or edit it to match current pricing merely
+to bypass a drift refusal.
+
+The response-shape and failure-recovery tests are offline mocks; they do not
+establish a fresh Azure deployment or billing outcome.
+
+## Monitoring and policy boundaries
+
+The three scheduled rules keep a one-hour event lookback but select rows
+ingested in the latest five-minute interval before expansion. This avoids
+re-alerting the same stored row solely because scheduled lookbacks overlap;
+provider status updates or duplicate ingestion routes still require review.
+The drift namespace list includes the default `runtime-security-tests` scope.
+Hunts and the workbook retain ProductName so the legacy connector and XDR
+routes can be distinguished; row counts are not unique underlying alerts.
+
+The script creates the subscription-based Defender for Cloud **Legacy**
+connector. For a workspace integrated with Defender XDR, review Microsoft's
+current connector/incident guidance to avoid duplicate ingestion and incidents.
+Sentinel in the Azure portal ends support on March 31, 2027; Defender-portal
+workspaces without XDR have a different connector path.
+
+The Container Insights add-on is enabled, but this bundle does not configure a
+DCR/association or assert that ContainerLogV2/KubePodInventory is populated.
+Verify that collection separately using Microsoft's supported onboarding
+procedure. Lab queries use SecurityAlert and kube-audit AzureDiagnostics. The
+redundant kube-audit-admin stream and unused AllMetrics export are omitted.
+
+Policy preflight includes inherited assignments and direct members of policy
+initiatives. Unreadable initiatives fail closed before replacing the managed
+sensor. A matching definition is conservatively treated as a conflict; review
+parameters/exemptions rather than assuming an initiative cannot apply. The
+exclusion tag retained for compatibility is not proof that AKS provisioning is
+disabled; effective policy and Defender profile checks remain necessary.
+
+The Linux Azure Network Policy Manager choice remains supported into 2028; a
+Cilium migration changes cluster networking and is not performed silently by
+this maintenance update. Audit JSON-query optimization likewise requires
+representative profiling before adding filters that might drop encoded input.
 
 ## Resources
 

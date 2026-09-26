@@ -4,7 +4,7 @@
     {
       "type": 1,
       "content": {
-        "json": "# Container Runtime Security Dashboard\n\nMonitor binary drift and anti-malware alerts plus kubectl exec activity across AKS clusters. Review gated-deployment decisions in Defender for Cloud > Environment settings > Security rules > Gated deployment > Admission Monitoring; Microsoft does not document them as a SecurityAlert AlertType."
+        "json": "# Container Runtime Security Dashboard\n\nMonitor binary drift and anti-malware alerts plus kubectl exec activity across AKS clusters. Review gated-deployment decisions in Defender for Cloud > Environment settings > Security rules > Gated deployment > Admission Monitoring; Microsoft does not document them as a SecurityAlert AlertType.\n\nAlert counts are ingested rows. Separate ProductName series can contain the same underlying alert; validate your canonical ingestion route before interpreting totals as unique detections."
       },
       "name": "header"
     },
@@ -24,10 +24,30 @@
             },
             "typeSettings": {
               "selectableValues": [
-                { "durationMs": 3600000, "isInitialTime": false, "grain": 1, "useDashboardTimeRange": false },
-                { "durationMs": 86400000, "isInitialTime": false, "grain": 1, "useDashboardTimeRange": false },
-                { "durationMs": 604800000, "isInitialTime": false, "grain": 1, "useDashboardTimeRange": false },
-                { "durationMs": 2592000000, "isInitialTime": false, "grain": 1, "useDashboardTimeRange": false }
+                {
+                  "durationMs": 3600000,
+                  "isInitialTime": false,
+                  "grain": 1,
+                  "useDashboardTimeRange": false
+                },
+                {
+                  "durationMs": 86400000,
+                  "isInitialTime": false,
+                  "grain": 1,
+                  "useDashboardTimeRange": false
+                },
+                {
+                  "durationMs": 604800000,
+                  "isInitialTime": false,
+                  "grain": 1,
+                  "useDashboardTimeRange": false
+                },
+                {
+                  "durationMs": 2592000000,
+                  "isInitialTime": false,
+                  "grain": 1,
+                  "useDashboardTimeRange": false
+                }
               ]
             },
             "label": "Time Range"
@@ -40,9 +60,9 @@
       "type": 3,
       "content": {
         "version": "KqlItem/1.0",
-        "query": "SecurityAlert\n| where TimeGenerated {TimeRange}\n| where ProductName == \"Microsoft Defender for Cloud\"\n| where AlertType has_any (\"DriftDetection\", \"BinaryDrift\", \"MalwareDetected\", \"SuspectProcess\")\n| summarize Count = count() by bin(TimeGenerated, 1h), AlertType\n| render timechart",
+        "query": "SecurityAlert\n| where TimeGenerated {TimeRange}\n| where ProductName in~ (\"Azure Security Center\", \"Microsoft Defender for Cloud\")\n| where AlertType has_any (\"DriftDetection\", \"BinaryDrift\", \"MalwareDetected\", \"SuspectProcess\") or AlertName has_any (\"drift\", \"malware\")\n| summarize IngestedRows = count() by bin(TimeGenerated, 1h), ProductName, AlertType\n| render timechart",
         "size": 0,
-        "title": "Runtime Alert Timeline",
+        "title": "Runtime Alert Rows by Ingestion Source",
         "queryType": 0,
         "visualization": "timechart"
       },
@@ -52,7 +72,7 @@
       "type": 3,
       "content": {
         "version": "KqlItem/1.0",
-        "query": "SecurityAlert\n| where TimeGenerated {TimeRange}\n| where AlertType has_any (\"DriftDetection\", \"BinaryDrift\") or AlertName has \"drift\"\n| extend ParsedEntities = parse_json(Entities)\n| mv-expand Entity = ParsedEntities\n| where tostring(Entity.Type) == \"container\"\n| extend Namespace = tostring(Entity.Pod.Namespace.Name)\n| where isnotempty(Namespace)\n| summarize DriftCount = count() by Namespace\n| sort by DriftCount desc\n| render barchart",
+        "query": "SecurityAlert\n| where TimeGenerated {TimeRange}\n| where AlertType has_any (\"DriftDetection\", \"BinaryDrift\") or AlertName has \"drift\"\n| extend ParsedEntities = parse_json(Entities)\n| mv-expand Entity = ParsedEntities\n| where tostring(Entity.Type) == \"container\"\n| extend Namespace = tostring(Entity.Pod.Namespace.Name)\n| where isnotempty(Namespace)\n| summarize DriftCount = count() by ProductName, Namespace\n| sort by DriftCount desc\n| render barchart",
         "size": 0,
         "title": "Binary Drift by Namespace",
         "queryType": 0,
@@ -64,14 +84,17 @@
       "type": 3,
       "content": {
         "version": "KqlItem/1.0",
-        "query": "SecurityAlert\n| where TimeGenerated {TimeRange}\n| where AlertType has_any (\"DriftDetection\", \"BinaryDrift\") or AlertName has \"drift\"\n| extend ParsedEntities = parse_json(Entities)\n| extend ExtProps = parse_json(ExtendedProperties)\n| mv-expand Entity = ParsedEntities\n| where tostring(Entity.Type) == \"container\"\n| extend DriftedBinary = tostring(ExtProps[\"Suspicious Process\"])\n| extend ContainerName = tostring(Entity.Name)\n| extend Namespace = tostring(Entity.Pod.Namespace.Name)\n| extend ClusterName = CompromisedEntity\n| where isnotempty(DriftedBinary)\n| summarize Count = count(), Containers = make_set(ContainerName, 5), LastSeen = max(TimeGenerated) by DriftedBinary, Namespace, ClusterName\n| sort by Count desc\n| take 20",
+        "query": "SecurityAlert\n| where TimeGenerated {TimeRange}\n| where AlertType has_any (\"DriftDetection\", \"BinaryDrift\") or AlertName has \"drift\"\n| extend ParsedEntities = parse_json(Entities)\n| extend ExtProps = parse_json(ExtendedProperties)\n| mv-expand Entity = ParsedEntities\n| where tostring(Entity.Type) == \"container\"\n| extend DriftedBinary = tostring(ExtProps[\"Suspicious Process\"])\n| extend ContainerName = tostring(Entity.Name)\n| extend Namespace = tostring(Entity.Pod.Namespace.Name)\n| extend ClusterName = CompromisedEntity\n| where isnotempty(DriftedBinary)\n| summarize Count = count(), Containers = make_set(ContainerName, 5), LastSeen = max(TimeGenerated) by ProductName, DriftedBinary, Namespace, ClusterName\n| sort by Count desc\n| take 20",
         "size": 0,
         "title": "Top Drifted Binaries",
         "queryType": 0,
         "visualization": "table",
         "gridSettings": {
           "sortBy": [
-            { "itemKey": "Count", "sortOrder": 2 }
+            {
+              "itemKey": "Count",
+              "sortOrder": 2
+            }
           ]
         }
       },
@@ -81,7 +104,7 @@
       "type": 3,
       "content": {
         "version": "KqlItem/1.0",
-        "query": "AzureDiagnostics\n| where TimeGenerated {TimeRange}\n| where Category == \"kube-audit\"\n| extend RequestObject = parse_json(log_s)\n| extend Verb = tostring(RequestObject.verb)\n| extend RequestURI = tostring(RequestObject.requestURI)\n| extend Username = tostring(RequestObject.user.username)\n| extend SourceIP = tostring(RequestObject.sourceIPs[0])\n| where Verb in (\"create\", \"get\")\n| where RequestURI has \"/exec\"\n| where RequestURI !has \"kube-system\"\n| extend PodName = extract(@\"/pods/([^/]+)/exec\", 1, RequestURI)\n| extend Namespace = extract(@\"namespaces/([^/]+)/\", 1, RequestURI)\n| project TimeGenerated, Username, SourceIP, PodName, Namespace\n| sort by TimeGenerated desc\n| take 50",
+        "query": "AzureDiagnostics\n| where TimeGenerated {TimeRange}\n| where Category == \"kube-audit\"\n| extend RequestObject = parse_json(log_s)\n| extend Verb = tostring(RequestObject.verb)\n| extend RequestURI = tostring(RequestObject.requestURI)\n| extend Username = tostring(RequestObject.user.username)\n| extend SourceIP = tostring(RequestObject.sourceIPs[0])\n| where Verb in (\"create\", \"get\")\n| where RequestURI has \"/exec\"\n| extend PodName = extract(@\"/pods/([^/]+)/exec\", 1, RequestURI)\n| extend Namespace = extract(@\"namespaces/([^/]+)/\", 1, RequestURI)\n| project TimeGenerated, Username, SourceIP, PodName, Namespace\n| sort by TimeGenerated desc\n| take 50",
         "size": 0,
         "title": "kubectl exec Audit Trail",
         "queryType": 0,

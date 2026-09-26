@@ -1,4 +1,4 @@
-#Requires -Version 7.4
+#Requires -Version 7.6
 
 # Shared read-only checks. No credentials or raw kubeconfig are persisted.
 function Invoke-LabJson {

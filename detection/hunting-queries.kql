@@ -1,14 +1,16 @@
 // AKS Runtime Security Lab - Hunting Queries
 // Import into Sentinel > Hunting > Queries
+// ProductName is retained: two ingestion routes can contain the same alert.
+// Counts are ingested rows, not unique underlying detections.
 
 // ============================================================
 // Hunt 1: Container Processes Not in Original Image (Extended)
 // Broader drift hunt surfacing all unknown processes
 // ============================================================
 SecurityAlert
-| where ProductName == "Microsoft Defender for Cloud"
+| where ProductName in~ ("Azure Security Center", "Microsoft Defender for Cloud")
 | where AlertType has_any ("DriftDetection", "BinaryDrift",
-    "SuspectProcess", "CryptoMiner", "ToolExecution")
+    "SuspectProcess", "CryptoMiner", "ToolExecution") or AlertName has "drift"
 | extend ParsedEntities = parse_json(Entities)
 | extend ExtProps = parse_json(ExtendedProperties)
 | mv-expand Entity = ParsedEntities
@@ -17,12 +19,12 @@ SecurityAlert
 | extend Namespace = tostring(Entity.Pod.Namespace.Name)
 | extend ProcessName = tostring(ExtProps["Suspicious Process"])
 | where isnotempty(ContainerName)
-| summarize AlertCount = count(),
+| summarize IngestedRows = count(),
     AlertTypes = make_set(AlertType),
     FirstSeen = min(TimeGenerated),
     LastSeen = max(TimeGenerated)
-    by ContainerName, ProcessName, Namespace
-| sort by AlertCount desc
+    by ProductName, ContainerName, ProcessName, Namespace
+| sort by IngestedRows desc
 
 // ============================================================
 // Hunt 2: Cluster Admin Actions from Unexpected Users
@@ -53,7 +55,7 @@ AzureDiagnostics
 // Catches C2 callbacks and data exfiltration
 // ============================================================
 SecurityAlert
-| where ProductName == "Microsoft Defender for Cloud"
+| where ProductName in~ ("Azure Security Center", "Microsoft Defender for Cloud")
 | where AlertType has_any ("NetworkActivity",
     "SuspiciousConnection", "C2Connection")
 | extend ParsedEntities = parse_json(Entities)
@@ -64,6 +66,6 @@ SecurityAlert
 | extend ContainerName = tostring(ExtProps["Container Name"])
 | where isnotempty(DestinationIP)
 | where not(ipv4_is_private(DestinationIP))
-| project TimeGenerated, ContainerName,
+| project TimeGenerated, ProductName, ContainerName,
     DestinationIP, AlertName, AlertSeverity
 | sort by TimeGenerated desc

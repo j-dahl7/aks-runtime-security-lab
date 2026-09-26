@@ -1,4 +1,4 @@
-#Requires -Version 7.4
+#Requires -Version 7.6
 
 <#
 .SYNOPSIS
@@ -8,7 +8,7 @@
     Deploys a complete AKS runtime security lab with Defender for Containers:
     1. AKS cluster via Bicep (no Defender security profile)
     2. Defender for Containers plan enablement (with AntiMalware extension)
-    3. Defender sensor via Helm chart (pinned 0.11.4 with anti-malware collector)
+    3. Defender sensor via Helm chart (pinned 0.11.5 with anti-malware collector)
     4. Sentinel analytics rules (3 scheduled rules, disabled unless explicitly enabled)
     5. Sentinel workbook (Container Runtime Security Dashboard)
 
@@ -28,6 +28,10 @@
 .PARAMETER ApiServerAuthorizedIpRanges
     Operator egress IPv4 CIDRs, /24 through /32. Required for first deployment.
     Owned reruns reuse the exact recorded ranges when this parameter is omitted.
+
+.PARAMETER KubernetesVersion
+    Exact GA patch version for a new cluster. When omitted, resolve the region's
+    default GA patch and record it. Owned reruns retain the recorded version.
 
 .PARAMETER EnableSentinelRules
     Enable the three Sentinel analytics rules after query and telemetry review.
@@ -63,6 +67,9 @@ param(
 
     [string[]]$ApiServerAuthorizedIpRanges = @(),
 
+    [ValidatePattern('^1\.[0-9]+\.[0-9]+$')]
+    [string]$KubernetesVersion,
+
     [Parameter()]
     [switch]$SkipSentinel,
 
@@ -82,7 +89,7 @@ $WorkspaceName = "$ProjectName-law"
 $DefenderPolicyDefinitionId = '64def556-fbad-4622-930e-72d1d5589bf5'
 $DefenderHelmReleaseName = 'defender-k8s'
 $DefenderHelmChart = 'oci://mcr.microsoft.com/azuredefender/microsoft-defender-for-containers'
-$DefenderHelmChartVersion = '0.11.4'
+$DefenderHelmChartVersion = '0.11.5'
 $DefenderExclusionTag = 'ms_defender_e2e_discovery_exclude'
 $OwnershipTagName = 'nlzt-owner'
 $StatePath = Join-Path $LabRoot ".aks-runtime-lab-state-$ProjectName.json"
@@ -108,14 +115,76 @@ function Invoke-AzJson {
         [switch]$NotFoundIsNull
     )
 
-    $output = & az @Arguments 2>&1
-    $exitCode = $LASTEXITCODE
-    $text = ($output | Out-String).Trim()
-    if ($exitCode -ne 0) {
-        if ($NotFoundIsNull -and $text -match '(?i)(ResourceGroupNotFound|ResourceNotFound|not found|could not be found|status code.?404|HTTP 404)') {
-            return $null
+    $command = Get-Command az -ErrorAction Stop
+    if ($command.CommandType -in @('Function', 'Filter')) {
+        # Preserve the offline harness contract while keeping its error stream
+        # separate from JSON, just like the native-process path below.
+        $errors = [System.Collections.Generic.List[string]]::new()
+        $output = @(& az @Arguments 2>&1 | ForEach-Object {
+            if ($_ -is [System.Management.Automation.ErrorRecord]) { $errors.Add([string]$_) }
+            else { $_ }
+        })
+        $exitCode = $LASTEXITCODE
+        $stderr = $errors -join "`n"
+        $text = ($output | Out-String).Trim()
+    }
+    else {
+        $start = [System.Diagnostics.ProcessStartInfo]::new()
+        $start.FileName = $command.Source
+        if ([System.IO.Path]::GetExtension($start.FileName) -in @('.cmd', '.bat')) {
+            # The Windows MSI wrapper expands %* through cmd.exe. Invoke its
+            # bundled Python directly so URLs/JSON remain individual arguments.
+            $python = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $command.Source) '../python.exe'))
+            if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
+                throw 'The Azure CLI batch wrapper has no adjacent bundled python.exe; use a supported native Azure CLI installation.'
+            }
+            $start.FileName = $python
+            foreach ($argument in @('-IBm', 'azure.cli')) { $start.ArgumentList.Add($argument) }
         }
-        throw "Azure CLI command failed: $text"
+        foreach ($argument in $Arguments) { $start.ArgumentList.Add($argument) }
+        $start.UseShellExecute = $false
+        $start.CreateNoWindow = $true
+        $start.RedirectStandardOutput = $true
+        $start.RedirectStandardError = $true
+        $process = [System.Diagnostics.Process]::new()
+        $process.StartInfo = $start
+        try {
+            if (-not $process.Start()) { throw 'Could not start Azure CLI.' }
+            $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+            $stderrTask = $process.StandardError.ReadToEndAsync()
+            $process.WaitForExit()
+            $text = $stdoutTask.GetAwaiter().GetResult().Trim()
+            $stderr = $stderrTask.GetAwaiter().GetResult().Trim()
+            $exitCode = $process.ExitCode
+        }
+        finally { $process.Dispose() }
+    }
+    if ($exitCode -ne 0) {
+        $errorText = "$stderr`n$text"
+        $providerCode = $null
+        $isNotFound = $false
+        if ($errorText -match '(?im)^\s*(?:ERROR:\s*)?\(([A-Za-z][A-Za-z0-9_.]{0,79})\)') {
+            $providerCode = $Matches[1]
+            $isNotFound = $providerCode -in @('ResourceGroupNotFound', 'ResourceNotFound', 'Request_ResourceNotFound')
+        }
+        elseif ($errorText.Trim() -match '^(?s)(?:ERROR:\s*)?(?<reason>Bad Request|Unauthorized|Forbidden|Not Found|Conflict|Too Many Requests|Internal Server Error|Service Unavailable|Gateway Timeout)\((?<body>\{.*\})\)$') {
+            # az rest wraps the structured provider body in its HTTP reason.
+            # Require both the 404 reason and a known absence code; do not
+            # search arbitrary message text/identifiers for the digits 404.
+            $reason = $Matches.reason
+            $bodyText = $Matches.body
+            try {
+                $candidateCode = [string](($bodyText | ConvertFrom-Json -ErrorAction Stop).error.code)
+                if ($candidateCode -match '^[A-Za-z][A-Za-z0-9_.]{0,79}$') { $providerCode = $candidateCode }
+                $isNotFound = $reason -eq 'Not Found' -and $providerCode -in @('ResourceGroupNotFound', 'ResourceNotFound', 'Request_ResourceNotFound')
+            }
+            catch { $isNotFound = $false }
+        }
+        if ($NotFoundIsNull -and $isNotFound) { return $null }
+        # Callers may handle this error without exposing a response body or an
+        # argument containing credentials in a terminal/transcript.
+        $errorCode = if ($providerCode) { " ($providerCode)" } else { '' }
+        throw "Azure CLI command failed with exit code $exitCode$errorCode."
     }
     if (-not $text) { return $null }
     return $text | ConvertFrom-Json
@@ -235,7 +304,7 @@ function Get-WritablePricingProperties {
     param([Parameter(Mandatory)]$Properties)
 
     $writable = @('pricingTier', 'subPlan', 'enforce', 'extensions', 'securityOperatorResourceId')
-    $readOnly = @('freeTrialRemainingTime', 'inherited', 'inheritedFrom', 'resourcesCoverageStatus', 'deprecated', 'replacedBy')
+    $readOnly = @('enablementTime', 'freeTrialRemainingTime', 'inherited', 'inheritedFrom', 'resourcesCoverageStatus', 'deprecated', 'replacedBy')
     $unknown = @($Properties.PSObject.Properties.Name | Where-Object { $_ -notin $writable -and $_ -notin $readOnly })
     if ($unknown.Count -gt 0) {
         throw "Defender pricing contains unrecognized properties that this lab will not risk dropping: $($unknown -join ', ')"
@@ -245,7 +314,30 @@ function Get-WritablePricingProperties {
     foreach ($name in $writable) {
         $property = $Properties.PSObject.Properties[$name]
         if ($property -and $null -ne $property.Value) {
-            $result[$name] = $property.Value
+            if ($name -ne 'extensions') {
+                $result[$name] = $property.Value
+                continue
+            }
+            $extensions = @($property.Value | Where-Object { $null -ne $_ } | ForEach-Object {
+                $extension = $_
+                $unknownExtension = @($extension.PSObject.Properties.Name | Where-Object {
+                    $_ -notin @('name', 'isEnabled', 'additionalExtensionProperties', 'operationStatus')
+                })
+                if ($unknownExtension.Count -or -not $extension.name -or [string]$extension.isEnabled -notmatch '^(?i:true|false)$') {
+                    throw 'Defender pricing contains an invalid extension or unrecognized extension properties.'
+                }
+                # operationStatus is response-only. Never fingerprint it or
+                # include it in a restore body. Empty collections normalize away.
+                $copy = [ordered]@{ name = [string]$extension.name; isEnabled = if ([string]$extension.isEnabled -ieq 'true') { 'True' } else { 'False' } }
+                if ($null -ne $extension.additionalExtensionProperties -and @($extension.additionalExtensionProperties.PSObject.Properties).Count) {
+                    $copy.additionalExtensionProperties = $extension.additionalExtensionProperties
+                }
+                [pscustomobject]$copy
+            })
+            if (@($extensions | Group-Object name | Where-Object Count -gt 1).Count) {
+                throw 'Defender pricing contains duplicate extensions.'
+            }
+            if ($extensions.Count) { $result.extensions = $extensions }
         }
     }
     if (-not $result.Contains('pricingTier')) {
@@ -259,7 +351,7 @@ function New-DesiredPricingProperties {
 
     $desired = Get-WritablePricingProperties $CurrentProperties
     $desired.pricingTier = 'Standard'
-    $extensions = @($desired.extensions)
+    $extensions = @($desired.extensions | Where-Object { $null -ne $_ })
     $duplicateNames = @($extensions | Group-Object name | Where-Object Count -gt 1)
     if ($duplicateNames.Count -gt 0) {
         throw "Defender pricing contains duplicate extensions: $($duplicateNames.Name -join ', ')"
@@ -330,9 +422,46 @@ function Set-PricingProperties {
         [Parameter(Mandatory)]$Properties,
         [Parameter(Mandatory)][string]$Action
     )
-    $body = @{ properties = $Properties } | ConvertTo-Json -Depth 30 -Compress
-    az rest --method PUT --url $Url --body $body --headers 'Content-Type=application/json' --output none 2>$null
-    Assert-LastExitCode -Action $Action
+    $body = @{ properties = (Get-WritablePricingProperties $Properties) } | ConvertTo-Json -Depth 30 -Compress
+    $bodyFile = [System.IO.Path]::GetTempFileName()
+    try {
+        [System.IO.File]::WriteAllText($bodyFile, $body, [System.Text.UTF8Encoding]::new($false))
+        $response = Invoke-AzJson -Arguments @('rest', '--method', 'PUT', '--url', $Url, '--body', "@$bodyFile", '--headers', 'Content-Type=application/json', '--only-show-errors', '--output', 'json')
+        if (-not $response.properties) { throw "$Action did not return the applied pricing properties; manifest retained." }
+        return $response.properties
+    }
+    finally { Remove-Item -LiteralPath $bodyFile -Force -ErrorAction SilentlyContinue }
+}
+
+function Assert-DesiredPricingApplied {
+    param([Parameter(Mandatory)]$Actual, [Parameter(Mandatory)]$Desired)
+    $normalized = Get-WritablePricingProperties $Actual
+    foreach ($property in $Desired.PSObject.Properties | Where-Object Name -ne 'extensions') {
+        if ((ConvertTo-CanonicalValue $normalized.($property.Name) | ConvertTo-Json -Depth 30 -Compress) -cne
+            (ConvertTo-CanonicalValue $property.Value | ConvertTo-Json -Depth 30 -Compress)) {
+            throw "Defender pricing did not persist requested property '$($property.Name)'."
+        }
+    }
+    foreach ($expected in @($Desired.extensions | Where-Object { $null -ne $_ })) {
+        $actualExtension = @($normalized.extensions | Where-Object name -eq $expected.name)
+        if ($actualExtension.Count -ne 1 -or
+            (ConvertTo-CanonicalValue $actualExtension[0] | ConvertTo-Json -Depth 30 -Compress) -cne
+            (ConvertTo-CanonicalValue $expected | ConvertTo-Json -Depth 30 -Compress)) {
+            throw "Defender pricing did not persist requested extension '$($expected.name)'."
+        }
+        $raw = @($Actual.extensions | Where-Object name -eq $expected.name)[0]
+        if ($raw.operationStatus -and $raw.operationStatus.code -ne 'Succeeded') {
+            throw "Defender pricing extension '$($expected.name)' did not report successful application."
+        }
+    }
+}
+
+function Get-AppliedPricingState {
+    param([Parameter(Mandatory)]$State)
+    # Old manifests can be recovered only when the normalized requested state
+    # matches exactly. Never adopt an arbitrary current shared configuration.
+    if ($State.pricingApplied) { return $State.pricingApplied }
+    return $State.pricingDesired
 }
 
 function Restore-PricingIfUnchanged {
@@ -342,10 +471,11 @@ function Restore-PricingIfUnchanged {
     )
 
     $current = Invoke-AzJson -Arguments @('rest', '--method', 'GET', '--url', $Context.url, '--only-show-errors', '--output', 'json')
+    if ((Get-PricingFingerprint $current.properties) -eq (Get-PricingFingerprint $Context.before)) { return }
     if ((Get-PricingFingerprint $current.properties) -ne (Get-PricingFingerprint $Context.desired)) {
         throw "Refusing to restore Defender pricing after $Reason because the shared setting changed after this lab wrote it."
     }
-    Set-PricingProperties -Url $Context.url -Properties $Context.before -Action "Defender pricing restore after $Reason"
+    $null = Set-PricingProperties -Url $Context.url -Properties $Context.before -Action "Defender pricing restore after $Reason"
 }
 
 trap {
@@ -456,6 +586,34 @@ function Remove-SecureHelmValuesFile {
     }
 }
 
+function Resolve-LabKubernetesVersion {
+    param($State, $ExistingCluster, [string]$RequestedVersion, [string]$Location, [string]$SubscriptionId)
+    $recorded = [string]$State.kubernetesVersion
+    $liveVersion = [string]$ExistingCluster.currentKubernetesVersion
+    if (-not $liveVersion) { $liveVersion = [string]$ExistingCluster.kubernetesVersion }
+    if ($recorded -and $liveVersion -and $recorded -ne $liveVersion) {
+        throw 'The live Kubernetes version differs from the ownership manifest; refusing an implicit upgrade or downgrade.'
+    }
+    if (-not $recorded -and $ExistingCluster) {
+        $recorded = $liveVersion
+    }
+    if ($recorded) {
+        if ($recorded -notmatch '^1\.[0-9]+\.[0-9]+$') { throw 'The existing cluster has no exact Kubernetes patch version; review its state before rerunning deployment.' }
+        if ($RequestedVersion -and $RequestedVersion -ne $recorded) { throw 'Owned reruns must use the recorded Kubernetes version; upgrades require a separately reviewed operation.' }
+        return $recorded
+    }
+    $versions = Invoke-AzJson -Arguments @('aks', 'get-versions', '--location', $Location, '--subscription', $SubscriptionId, '--only-show-errors', '--output', 'json')
+    $candidates = @($versions.values | Where-Object { $_.isPreview -ne $true })
+    if (-not $RequestedVersion) { $candidates = @($candidates | Where-Object { $_.isDefault -eq $true }) }
+    $patches = @($candidates | ForEach-Object {
+        if ([string]$_.version -match '^1\.[0-9]+\.[0-9]+$') { [string]$_.version }
+        if ($_.patchVersions) { $_.patchVersions.PSObject.Properties.Name | Where-Object { $_ -match '^1\.[0-9]+\.[0-9]+$' } }
+    } | Where-Object { [version]$_ -ge [version]'1.32.0' } | Sort-Object { [version]$_ } -Descending -Unique)
+    if ($RequestedVersion) { $patches = @($patches | Where-Object { $_ -eq $RequestedVersion }) }
+    if (-not $patches.Count) { throw 'No supported GA Kubernetes patch version was resolved for this region. Review az aks get-versions and provide -KubernetesVersion before deploying.' }
+    return $patches[0]
+}
+
 function Get-ConflictingDefenderPolicyAssignments {
     param(
         [Parameter(Mandatory)]
@@ -465,25 +623,28 @@ function Get-ConflictingDefenderPolicyAssignments {
         [string]$ResourceGroupName
     )
 
-    $assignments = @()
-    $scopeArgumentSets = @(
-        @('--scope', "/subscriptions/$SubscriptionId"),
-        @('--resource-group', $ResourceGroupName)
-    )
-
-    foreach ($scopeArguments in $scopeArgumentSets) {
-        $json = az policy assignment list @scopeArguments --subscription $SubscriptionId --output json
-        Assert-LastExitCode -Action 'Defender auto-provision policy lookup'
-        if (-not [string]::IsNullOrWhiteSpace(($json -join "`n"))) {
-            $assignments += @(($json -join "`n") | ConvertFrom-Json)
+    $assignments = @(Invoke-AzJson -Arguments @('policy', 'assignment', 'list', '--resource-group', $ResourceGroupName, '--subscription', $SubscriptionId, '--filter', 'atScope()', '--only-show-errors', '--output', 'json'))
+    $definitionCache = @{}
+    $conflicts = foreach ($assignment in $assignments) {
+        $definitionId = [string]$assignment.policyDefinitionId
+        if (-not $definitionId) { $definitionId = [string]$assignment.properties.policyDefinitionId }
+        if (-not $definitionId) { throw 'Policy assignment inventory is missing a definition ID; sensor provisioning was stopped.' }
+        $memberIds = @($definitionId)
+        if ($definitionId -match '(?i)/policySetDefinitions/') {
+            if ($definitionId -notmatch '^/(?:subscriptions/[0-9a-fA-F-]{36}/|providers/Microsoft.Management/managementGroups/[A-Za-z0-9_.()-]+/)?providers/Microsoft.Authorization/policySetDefinitions/[A-Za-z0-9_.()-]+$' -or
+                @($definitionId.Split('/') | Where-Object { $_ -in @('.', '..') }).Count) {
+                throw 'Policy initiative inventory contains a noncanonical ID; sensor provisioning was stopped.'
+            }
+            if (-not $definitionCache.ContainsKey($definitionId)) {
+                $definition = Invoke-AzJson -Arguments @('rest', '--method', 'GET', '--url', "https://management.azure.com${definitionId}?api-version=2023-04-01", '--only-show-errors', '--output', 'json')
+                if ($null -eq $definition.properties.policyDefinitions) { throw 'Policy initiative members could not be verified; sensor provisioning was stopped.' }
+                $definitionCache[$definitionId] = @($definition.properties.policyDefinitions | ForEach-Object { [string]$_.policyDefinitionId })
+            }
+            $memberIds = $definitionCache[$definitionId]
         }
+        if (@($memberIds | Where-Object { $_.EndsWith("/policyDefinitions/$DefenderPolicyDefinitionId", [StringComparison]::OrdinalIgnoreCase) }).Count) { $assignment }
     }
-
-    return @(
-        $assignments |
-            Where-Object { $_.policyDefinitionId -like "*$DefenderPolicyDefinitionId*" } |
-            Sort-Object -Property id -Unique
-    )
+    return @($conflicts | Sort-Object -Property id -Unique)
 }
 
 function Get-StaleDefenderClusterResources {
@@ -642,7 +803,7 @@ if ($Destroy) {
     if ([bool]$state.pricingChanged) {
         $pricingCurrent = Invoke-AzJson -Arguments @('rest', '--method', 'GET', '--url', $pricingUrl, '--only-show-errors', '--output', 'json')
         $pricingAlreadyRestored = (Get-PricingFingerprint $pricingCurrent.properties) -eq (Get-PricingFingerprint $state.pricingBefore)
-        if (-not $pricingAlreadyRestored -and (Get-PricingFingerprint $pricingCurrent.properties) -ne (Get-PricingFingerprint $state.pricingDesired)) {
+        if (-not $pricingAlreadyRestored -and (Get-PricingFingerprint $pricingCurrent.properties) -ne (Get-PricingFingerprint (Get-AppliedPricingState $state))) {
             throw 'Refusing cleanup because the shared Defender pricing setting changed after this lab configured it.'
         }
     }
@@ -661,9 +822,9 @@ if ($Destroy) {
         # makes a failed restore (or a prior successful restore) safely resumable.
         if ([bool]$state.pricingChanged -and -not $pricingAlreadyRestored) {
             $pricingLatest = Invoke-AzJson -Arguments @('rest', '--method', 'GET', '--url', $pricingUrl, '--only-show-errors', '--output', 'json')
-            if ((Get-PricingFingerprint $pricingLatest.properties) -ne (Get-PricingFingerprint $state.pricingDesired)) { throw 'Shared pricing changed during deletion; manifest retained and pricing not overwritten.' }
+            if ((Get-PricingFingerprint $pricingLatest.properties) -ne (Get-PricingFingerprint (Get-AppliedPricingState $state))) { throw 'Shared pricing changed during deletion; manifest retained and pricing not overwritten.' }
             if (-not $PSCmdlet.ShouldProcess('Defender for Containers pricing', 'Restore captured pre-lab shared setting after verified deletion')) { return }
-            Set-PricingProperties -Url $pricingUrl -Properties $state.pricingBefore -Action 'Defender for Containers pricing restore'
+            $null = Set-PricingProperties -Url $pricingUrl -Properties $state.pricingBefore -Action 'Defender for Containers pricing restore'
             $restored = Invoke-AzJson -Arguments @('rest', '--method', 'GET', '--url', $pricingUrl, '--only-show-errors', '--output', 'json')
             if ((Get-PricingFingerprint $restored.properties) -ne (Get-PricingFingerprint $state.pricingBefore)) { throw 'Shared pricing restore was not verified; manifest retained.' }
         }
@@ -685,10 +846,19 @@ if ($state.apiServerAuthorizedIpRanges) {
     $ApiServerAuthorizedIpRanges = @($state.apiServerAuthorizedIpRanges)
 }
 Assert-ApiServerRanges -Ranges $ApiServerAuthorizedIpRanges
-if ($existingResourceGroup -and $state.runtimeProof) {
+$liveCluster = $null
+if ($existingResourceGroup) {
     $liveCluster = Invoke-AzJson -Arguments @('aks', 'show', '--resource-group', $ResourceGroup, '--name', $ProjectName, '--subscription', $subscriptionId, '--output', 'json')
-    Assert-LiveCluster -State $state -Cluster $liveCluster
+    if ($state.runtimeProof) { Assert-LiveCluster -State $state -Cluster $liveCluster }
 }
+$helmRollbackArgument = '--atomic'
+if (-not $Destroy -and -not $WhatIfPreference) {
+    $helmVersion = [string](helm version --short)
+    Assert-LastExitCode -Action 'Helm version lookup'
+    if ($helmVersion -notmatch '^v([34])\.') { throw 'Use a supported Helm 3 or 4 release; the installed major version could not be verified.' }
+    if ($Matches[1] -eq '4') { $helmRollbackArgument = '--rollback-on-failure' }
+}
+$resolvedVersion = Resolve-LabKubernetesVersion -State $state -ExistingCluster $liveCluster -RequestedVersion $KubernetesVersion -Location $Location -SubscriptionId $subscriptionId
 
 $currentPricingResource = Invoke-AzJson -Arguments @('rest', '--method', 'GET', '--url', $pricingUrl, '--only-show-errors', '--output', 'json')
 $currentPricing = Get-WritablePricingProperties $currentPricingResource.properties
@@ -698,7 +868,7 @@ if ($state) {
     $desiredPricing = $state.pricingDesired
     $currentFingerprint = Get-PricingFingerprint $currentPricing
     $beforeFingerprint = Get-PricingFingerprint $pricingBefore
-    $desiredFingerprint = Get-PricingFingerprint $desiredPricing
+    $desiredFingerprint = Get-PricingFingerprint (Get-AppliedPricingState $state)
     if ($currentFingerprint -ne $beforeFingerprint -and $currentFingerprint -ne $desiredFingerprint) {
         throw 'Shared Defender pricing drifted from both the captured before-state and this lab desired-state.'
     }
@@ -718,6 +888,7 @@ else {
         subscriptionId = $subscriptionId
         tenantId = [string]$account.tenantId
         apiServerAuthorizedIpRanges = @($ApiServerAuthorizedIpRanges)
+        kubernetesVersion = $resolvedVersion
         resourceGroupId = $resourceGroupId
         workspaceId = $workspaceId
         pricingChanged = $defenderPlanNeedsUpdate
@@ -729,6 +900,7 @@ else {
         sentinelWorkbookId = Get-StableGuid "$ownerToken|$workspaceId|workbook"
     }
 }
+if (-not $state.kubernetesVersion) { $state | Add-Member NoteProperty kubernetesVersion $resolvedVersion }
 
 if ($WhatIfPreference) {
     $sentinelPreview = if ($SkipSentinel) { 'Skip Sentinel rules and workbook' } else { 'Preflight and deploy 3 owned Sentinel rules and 1 owned workbook' }
@@ -738,7 +910,7 @@ if ($WhatIfPreference) {
 No Azure, Kubernetes, Helm, kubeconfig, or local secret-file mutations were performed.
 
 Planned changes:
-  - Deploy AKS cluster: $ProjectName (Kubernetes 1.35, 1 node, Standard_D4s_v3)
+  - Deploy AKS cluster: $ProjectName (Kubernetes $resolvedVersion, 1 node, Standard_D4s_v3)
   - Deploy workspace:   $WorkspaceName
   - Merge required Defender for Containers settings while preserving other extensions/properties
   - Replace the managed AKS Defender profile with Helm chart $DefenderHelmChartVersion
@@ -778,10 +950,11 @@ $bicepPath = Join-Path $LabRoot 'bicep/main.bicep'
 
 if ($PSCmdlet.ShouldProcess("Subscription", "Deploy Bicep template")) {
     $deployment = az deployment sub create `
+        --name "aks-$ProjectName-$Location" `
         --subscription $subscriptionId `
         --location $Location `
         --template-file $bicepPath `
-        --parameters projectName=$ProjectName location=$Location ownerToken=$ownerToken "apiServerAuthorizedIpRanges=$(ConvertTo-Json -InputObject @($ApiServerAuthorizedIpRanges) -Compress)" `
+        --parameters projectName=$ProjectName location=$Location ownerToken=$ownerToken kubernetesVersion=$resolvedVersion "apiServerAuthorizedIpRanges=$(ConvertTo-Json -InputObject @($ApiServerAuthorizedIpRanges) -Compress)" `
         --query 'properties.outputs' -o json | ConvertFrom-Json
     Assert-LastExitCode -Action 'AKS lab infrastructure deployment'
 
@@ -807,15 +980,28 @@ if ($PSCmdlet.ShouldProcess("Subscription", "Deploy Bicep template")) {
 Write-Host "`n[3/7] Enabling Defender for Containers plan..." -ForegroundColor Yellow
 
 if ($defenderPlanNeedsUpdate -and $PSCmdlet.ShouldProcess("Subscription", "Enable Defender for Containers")) {
+    $latestPricing = Invoke-AzJson -Arguments @('rest', '--method', 'GET', '--url', $pricingUrl, '--only-show-errors', '--output', 'json')
+    if ((Get-PricingFingerprint $latestPricing.properties) -ne (Get-PricingFingerprint $currentPricing)) {
+        throw 'Shared Defender pricing changed during infrastructure deployment; no pricing write was attempted.'
+    }
     $script:PricingRollbackContext = [pscustomobject]@{
         url = $pricingUrl
         before = $pricingBefore
         desired = $desiredPricing
     }
-    Set-PricingProperties -Url $pricingUrl -Properties $desiredPricing -Action 'Defender for Containers configuration'
+    $appliedResponse = Set-PricingProperties -Url $pricingUrl -Properties $desiredPricing -Action 'Defender for Containers configuration'
+    # Bind rollback/drift checks to the PUT response, not a later GET that may
+    # contain another operator's change. This is best-effort compare-before-write;
+    # the pricing API does not expose a conditional-write token in this contract.
+    $appliedPricing = Get-WritablePricingProperties $appliedResponse
+    $script:PricingRollbackContext.desired = $appliedPricing
+    if ($state -is [System.Collections.IDictionary]) { $state.pricingApplied = $appliedPricing }
+    else { $state | Add-Member -MemberType NoteProperty -Name pricingApplied -Value $appliedPricing -Force }
+    Write-LabState $state
+    Assert-DesiredPricingApplied -Actual $appliedResponse -Desired $desiredPricing
     $writtenPricing = Invoke-AzJson -Arguments @('rest', '--method', 'GET', '--url', $pricingUrl, '--only-show-errors', '--output', 'json')
-    if ((Get-PricingFingerprint $writtenPricing.properties) -ne (Get-PricingFingerprint $desiredPricing)) {
-        throw 'Defender for Containers did not persist the exact merged desired state.'
+    if ((Get-PricingFingerprint $writtenPricing.properties) -ne (Get-PricingFingerprint $appliedPricing)) {
+        throw 'Defender for Containers changed after the pricing write; manifest retained and shared state will not be overwritten.'
     }
 
     Write-Host "  Defender for Containers: Enabled (with AntiMalware)" -ForegroundColor Green
@@ -914,29 +1100,9 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
         Write-Host "  Found $($staleClusterResources.Count) stale managed-sensor cluster resource(s); exact known resources will be removed before Helm." -ForegroundColor Yellow
     }
 
-    $workspaceCustomerId = az monitor log-analytics workspace show `
-        --subscription $subscriptionId `
-        --resource-group $ResourceGroup `
-        --workspace-name $WorkspaceName `
-        --query customerId `
-        --output tsv
-    Assert-LastExitCode -Action 'Log Analytics workspace ID lookup'
-    $workspaceCustomerId = [string](($workspaceCustomerId | Select-Object -First 1)).Trim()
-
-    $workspaceSharedKey = az monitor log-analytics workspace get-shared-keys `
-        --subscription $subscriptionId `
-        --resource-group $ResourceGroup `
-        --workspace-name $WorkspaceName `
-        --query primarySharedKey `
-        --output tsv
-    Assert-LastExitCode -Action 'Log Analytics workspace key lookup'
-    $workspaceSharedKey = [string](($workspaceSharedKey | Select-Object -First 1)).Trim()
-    if (-not $workspaceCustomerId -or -not $workspaceSharedKey) {
-        throw 'Log Analytics returned an empty workspace ID or shared key; refusing to deploy a sensor that cannot publish telemetry.'
-    }
-
-    # JSON is valid YAML. Keeping every Helm value in a locked-down file avoids
-    # exposing the workspace key through the process command line.
+    # The reviewed chart makes legacy workspace credentials optional. Use its
+    # identity-based publication path, consistent with current Helm guidance.
+    # JSON is valid YAML; retain the private temporary-file boundary for values.
     $helmValuesObject = @{
         global = @{
             cloudIdentifiers = @{
@@ -951,12 +1117,6 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
         'microsoft-defender-for-containers-sensor' = @{
             antimalwareCollector = @{
                 enabled = $true
-            }
-            omsagent = @{
-                secret = @{
-                    wsid = $workspaceCustomerId
-                    key  = $workspaceSharedKey
-                }
             }
         }
     }
@@ -997,7 +1157,7 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
                 --namespace mdc `
                 --create-namespace `
                 --values $temporaryValues.Path `
-                --atomic `
+                $helmRollbackArgument `
                 --wait `
                 --timeout 10m
             Assert-LastExitCode -Action 'Defender sensor Helm deployment'
@@ -1023,7 +1183,6 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
         }
     }
     finally {
-        $workspaceSharedKey = $null
         Remove-SecureHelmValuesFile -TemporaryValues $temporaryValues
     }
 
@@ -1085,7 +1244,7 @@ if (-not $SkipSentinel) {
             name     = 'LAB - Binary Drift in Production Namespace'
             severity = 'High'
             query    = @'
-union isfuzzy=true (datatable(TimeGenerated:datetime,AlertType:string,AlertName:string,Entities:string,ExtendedProperties:string,CompromisedEntity:string,AlertSeverity:string)[]), (SecurityAlert)
+union isfuzzy=true (datatable(TimeGenerated:datetime,AlertType:string,AlertName:string,Entities:string,ExtendedProperties:string,CompromisedEntity:string,AlertSeverity:string)[]), (SecurityAlert | where ingestion_time() > ago(5m))
 | where AlertType has_any ("DriftDetection", "BinaryDrift") or AlertName has "drift"
 | extend ParsedEntities = parse_json(Entities)
 | extend ExtProps = parse_json(ExtendedProperties)
@@ -1096,7 +1255,7 @@ union isfuzzy=true (datatable(TimeGenerated:datetime,AlertType:string,AlertName:
 | extend Namespace = tostring(Entity.Pod.Namespace.Name)
 | extend ClusterName = CompromisedEntity
 | extend DriftedBinary = tostring(ExtProps["Suspicious Process"])
-| where Namespace in ("default", "production", "kube-system")
+| where Namespace in ("default", "production", "kube-system", "runtime-security-tests")
 | where isnotempty(ContainerName)
 | project TimeGenerated, AlertSeverity, ClusterName, Namespace, PodName, ContainerName, DriftedBinary
 '@
@@ -1108,7 +1267,7 @@ union isfuzzy=true (datatable(TimeGenerated:datetime,AlertType:string,AlertName:
             name     = 'LAB - Container Malware Detected'
             severity = 'High'
             query    = @'
-union isfuzzy=true (datatable(TimeGenerated:datetime,AlertType:string,AlertName:string,Entities:string,ExtendedProperties:string,CompromisedEntity:string,AlertSeverity:string)[]), (SecurityAlert)
+union isfuzzy=true (datatable(TimeGenerated:datetime,AlertType:string,AlertName:string,Entities:string,ExtendedProperties:string,CompromisedEntity:string,AlertSeverity:string)[]), (SecurityAlert | where ingestion_time() > ago(5m))
 | where AlertType has "MalwareDetected" or AlertName has_any ("malware", "Malicious file")
 | extend ParsedEntities = parse_json(Entities)
 | extend ExtProps = parse_json(ExtendedProperties)
@@ -1134,6 +1293,7 @@ union isfuzzy=true (datatable(TimeGenerated:datetime,AlertType:string,AlertName:
             query    = @'
 AzureDiagnostics
 | where Category == "kube-audit"
+| where ingestion_time() > ago(5m)
 | extend RequestObject = parse_json(log_s)
 | extend Verb = tostring(RequestObject.verb)
 | extend RequestURI = tostring(RequestObject.requestURI)
@@ -1327,7 +1487,7 @@ Write-Host "`n=== Deployment Complete ===" -ForegroundColor Green
 Write-Host @"
 
 Resources deployed:
-  - AKS Cluster:    $clusterName (Kubernetes 1.35, 1 node, Standard_D4s_v3)
+  - AKS Cluster:    $clusterName (Kubernetes $resolvedVersion, 1 node, Standard_D4s_v3)
   - Defender:       Defender for Containers enabled (with AntiMalware extension)
   - Sensor:         Helm chart $DefenderHelmChartVersion (anti-malware collector enabled)
   - Workspace:      $WorkspaceName (Container Insights + Sentinel)

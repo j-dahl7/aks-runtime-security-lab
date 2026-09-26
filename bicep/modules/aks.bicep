@@ -1,6 +1,6 @@
 // AKS Cluster for Defender for Containers lab
 // Note: Defender sensor is deployed separately via Helm (Deploy-Lab.ps1 step 5)
-// using the version pinned by Deploy-Lab.ps1 (currently 0.11.4).
+// using the version pinned by Deploy-Lab.ps1 (currently 0.11.5).
 
 param projectName string
 param location string
@@ -72,7 +72,7 @@ resource aks 'Microsoft.ContainerService/managedClusters@2024-09-01' = {
 
     // Security profile - workload identity only
     // Defender sensor is deployed with the chart version pinned by Deploy-Lab.ps1
-    // (currently 0.11.4), including the anti-malware collector.
+    // (currently 0.11.5), including the anti-malware collector.
     securityProfile: {
       workloadIdentity: {
         enabled: true
@@ -89,21 +89,11 @@ resource aksDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-previe
     workspaceId: logAnalyticsWorkspaceId
     logs: [
       {
-        category: 'kube-audit-admin'
-        enabled: true
-      }
-      {
         category: 'kube-audit'
         enabled: true
       }
       {
         category: 'guard'
-        enabled: true
-      }
-    ]
-    metrics: [
-      {
-        category: 'AllMetrics'
         enabled: true
       }
     ]
