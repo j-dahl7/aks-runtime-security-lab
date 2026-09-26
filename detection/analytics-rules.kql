@@ -7,6 +7,7 @@
 // MITRE: T1105, T1059
 // ============================================================
 SecurityAlert
+| where ingestion_time() > ago(5m)
 | where AlertType has_any ("DriftDetection", "BinaryDrift")
     or AlertName has "drift"
 | extend ParsedEntities = parse_json(Entities)
@@ -18,7 +19,7 @@ SecurityAlert
 | extend Namespace = tostring(Entity.Pod.Namespace.Name)
 | extend ClusterName = CompromisedEntity
 | extend DriftedBinary = tostring(ExtProps["Suspicious Process"])
-| where Namespace in ("default", "production", "kube-system")
+| where Namespace in ("default", "production", "kube-system", "runtime-security-tests")
 | where isnotempty(ContainerName)
 | project TimeGenerated, AlertSeverity, ClusterName,
     Namespace, PodName, ContainerName, DriftedBinary
@@ -29,6 +30,7 @@ SecurityAlert
 // MITRE: T1105, T1204
 // ============================================================
 SecurityAlert
+| where ingestion_time() > ago(5m)
 | where AlertType has "MalwareDetected"
     or AlertName has_any ("malware", "Malicious file")
 | extend ParsedEntities = parse_json(Entities)
@@ -54,6 +56,7 @@ SecurityAlert
 // ============================================================
 AzureDiagnostics
 | where Category == "kube-audit"
+| where ingestion_time() > ago(5m)
 | extend RequestObject = parse_json(log_s)
 | extend Verb = tostring(RequestObject.verb)
 | extend RequestURI = tostring(RequestObject.requestURI)

@@ -1,4 +1,4 @@
-#Requires -Version 7.4
+#Requires -Version 7.6
 
 <#
 .SYNOPSIS
@@ -8,7 +8,7 @@
     Deploys a complete AKS runtime security lab with Defender for Containers:
     1. AKS cluster via Bicep (no Defender security profile)
     2. Defender for Containers plan enablement (with AntiMalware extension)
-    3. Defender sensor via Helm chart (pinned 0.11.4 with anti-malware collector)
+    3. Defender sensor via Helm chart (pinned 0.11.5 with anti-malware collector)
     4. Sentinel analytics rules (3 scheduled rules, disabled unless explicitly enabled)
     5. Sentinel workbook (Container Runtime Security Dashboard)
 
@@ -28,6 +28,10 @@
 .PARAMETER ApiServerAuthorizedIpRanges
     Operator egress IPv4 CIDRs, /24 through /32. Required for first deployment.
     Owned reruns reuse the exact recorded ranges when this parameter is omitted.
+
+.PARAMETER KubernetesVersion
+    Exact GA patch version for a new cluster. When omitted, resolve the region's
+    default GA patch and record it. Owned reruns retain the recorded version.
 
 .PARAMETER EnableSentinelRules
     Enable the three Sentinel analytics rules after query and telemetry review.
@@ -63,6 +67,9 @@ param(
 
     [string[]]$ApiServerAuthorizedIpRanges = @(),
 
+    [ValidatePattern('^1\.[0-9]+\.[0-9]+$')]
+    [string]$KubernetesVersion,
+
     [Parameter()]
     [switch]$SkipSentinel,
 
@@ -82,7 +89,7 @@ $WorkspaceName = "$ProjectName-law"
 $DefenderPolicyDefinitionId = '64def556-fbad-4622-930e-72d1d5589bf5'
 $DefenderHelmReleaseName = 'defender-k8s'
 $DefenderHelmChart = 'oci://mcr.microsoft.com/azuredefender/microsoft-defender-for-containers'
-$DefenderHelmChartVersion = '0.11.4'
+$DefenderHelmChartVersion = '0.11.5'
 $DefenderExclusionTag = 'ms_defender_e2e_discovery_exclude'
 $OwnershipTagName = 'nlzt-owner'
 $StatePath = Join-Path $LabRoot ".aks-runtime-lab-state-$ProjectName.json"
@@ -562,6 +569,34 @@ function Remove-SecureHelmValuesFile {
     }
 }
 
+function Resolve-LabKubernetesVersion {
+    param($State, $ExistingCluster, [string]$RequestedVersion, [string]$Location, [string]$SubscriptionId)
+    $recorded = [string]$State.kubernetesVersion
+    $liveVersion = [string]$ExistingCluster.currentKubernetesVersion
+    if (-not $liveVersion) { $liveVersion = [string]$ExistingCluster.kubernetesVersion }
+    if ($recorded -and $liveVersion -and $recorded -ne $liveVersion) {
+        throw 'The live Kubernetes version differs from the ownership manifest; refusing an implicit upgrade or downgrade.'
+    }
+    if (-not $recorded -and $ExistingCluster) {
+        $recorded = $liveVersion
+    }
+    if ($recorded) {
+        if ($recorded -notmatch '^1\.[0-9]+\.[0-9]+$') { throw 'The existing cluster has no exact Kubernetes patch version; review its state before rerunning deployment.' }
+        if ($RequestedVersion -and $RequestedVersion -ne $recorded) { throw 'Owned reruns must use the recorded Kubernetes version; upgrades require a separately reviewed operation.' }
+        return $recorded
+    }
+    $versions = Invoke-AzJson -Arguments @('aks', 'get-versions', '--location', $Location, '--subscription', $SubscriptionId, '--only-show-errors', '--output', 'json')
+    $candidates = @($versions.values | Where-Object { $_.isPreview -ne $true })
+    if (-not $RequestedVersion) { $candidates = @($candidates | Where-Object { $_.isDefault -eq $true }) }
+    $patches = @($candidates | ForEach-Object {
+        if ([string]$_.version -match '^1\.[0-9]+\.[0-9]+$') { [string]$_.version }
+        if ($_.patchVersions) { $_.patchVersions.PSObject.Properties.Name | Where-Object { $_ -match '^1\.[0-9]+\.[0-9]+$' } }
+    } | Where-Object { [version]$_ -ge [version]'1.31.0' } | Sort-Object { [version]$_ } -Descending -Unique)
+    if ($RequestedVersion) { $patches = @($patches | Where-Object { $_ -eq $RequestedVersion }) }
+    if (-not $patches.Count) { throw 'No supported GA Kubernetes patch version was resolved for this region. Review az aks get-versions and provide -KubernetesVersion before deploying.' }
+    return $patches[0]
+}
+
 function Get-ConflictingDefenderPolicyAssignments {
     param(
         [Parameter(Mandatory)]
@@ -571,25 +606,28 @@ function Get-ConflictingDefenderPolicyAssignments {
         [string]$ResourceGroupName
     )
 
-    $assignments = @()
-    $scopeArgumentSets = @(
-        @('--scope', "/subscriptions/$SubscriptionId"),
-        @('--resource-group', $ResourceGroupName)
-    )
-
-    foreach ($scopeArguments in $scopeArgumentSets) {
-        $json = az policy assignment list @scopeArguments --subscription $SubscriptionId --output json
-        Assert-LastExitCode -Action 'Defender auto-provision policy lookup'
-        if (-not [string]::IsNullOrWhiteSpace(($json -join "`n"))) {
-            $assignments += @(($json -join "`n") | ConvertFrom-Json)
+    $assignments = @(Invoke-AzJson -Arguments @('policy', 'assignment', 'list', '--resource-group', $ResourceGroupName, '--subscription', $SubscriptionId, '--filter', 'atScope()', '--only-show-errors', '--output', 'json'))
+    $definitionCache = @{}
+    $conflicts = foreach ($assignment in $assignments) {
+        $definitionId = [string]$assignment.policyDefinitionId
+        if (-not $definitionId) { $definitionId = [string]$assignment.properties.policyDefinitionId }
+        if (-not $definitionId) { throw 'Policy assignment inventory is missing a definition ID; sensor provisioning was stopped.' }
+        $memberIds = @($definitionId)
+        if ($definitionId -match '(?i)/policySetDefinitions/') {
+            if ($definitionId -notmatch '^/(?:subscriptions/[0-9a-fA-F-]{36}/|providers/Microsoft.Management/managementGroups/[A-Za-z0-9_.()-]+/)?providers/Microsoft.Authorization/policySetDefinitions/[A-Za-z0-9_.()-]+$' -or
+                @($definitionId.Split('/') | Where-Object { $_ -in @('.', '..') }).Count) {
+                throw 'Policy initiative inventory contains a noncanonical ID; sensor provisioning was stopped.'
+            }
+            if (-not $definitionCache.ContainsKey($definitionId)) {
+                $definition = Invoke-AzJson -Arguments @('rest', '--method', 'GET', '--url', "https://management.azure.com${definitionId}?api-version=2023-04-01", '--only-show-errors', '--output', 'json')
+                if ($null -eq $definition.properties.policyDefinitions) { throw 'Policy initiative members could not be verified; sensor provisioning was stopped.' }
+                $definitionCache[$definitionId] = @($definition.properties.policyDefinitions | ForEach-Object { [string]$_.policyDefinitionId })
+            }
+            $memberIds = $definitionCache[$definitionId]
         }
+        if (@($memberIds | Where-Object { $_.EndsWith("/policyDefinitions/$DefenderPolicyDefinitionId", [StringComparison]::OrdinalIgnoreCase) }).Count) { $assignment }
     }
-
-    return @(
-        $assignments |
-            Where-Object { $_.policyDefinitionId -like "*$DefenderPolicyDefinitionId*" } |
-            Sort-Object -Property id -Unique
-    )
+    return @($conflicts | Sort-Object -Property id -Unique)
 }
 
 function Get-StaleDefenderClusterResources {
@@ -791,10 +829,19 @@ if ($state.apiServerAuthorizedIpRanges) {
     $ApiServerAuthorizedIpRanges = @($state.apiServerAuthorizedIpRanges)
 }
 Assert-ApiServerRanges -Ranges $ApiServerAuthorizedIpRanges
-if ($existingResourceGroup -and $state.runtimeProof) {
+$liveCluster = $null
+if ($existingResourceGroup) {
     $liveCluster = Invoke-AzJson -Arguments @('aks', 'show', '--resource-group', $ResourceGroup, '--name', $ProjectName, '--subscription', $subscriptionId, '--output', 'json')
-    Assert-LiveCluster -State $state -Cluster $liveCluster
+    if ($state.runtimeProof) { Assert-LiveCluster -State $state -Cluster $liveCluster }
 }
+$helmRollbackArgument = '--atomic'
+if (-not $Destroy -and -not $WhatIfPreference) {
+    $helmVersion = [string](helm version --short)
+    Assert-LastExitCode -Action 'Helm version lookup'
+    if ($helmVersion -notmatch '^v([34])\.') { throw 'Use a supported Helm 3 or 4 release; the installed major version could not be verified.' }
+    if ($Matches[1] -eq '4') { $helmRollbackArgument = '--rollback-on-failure' }
+}
+$resolvedVersion = Resolve-LabKubernetesVersion -State $state -ExistingCluster $liveCluster -RequestedVersion $KubernetesVersion -Location $Location -SubscriptionId $subscriptionId
 
 $currentPricingResource = Invoke-AzJson -Arguments @('rest', '--method', 'GET', '--url', $pricingUrl, '--only-show-errors', '--output', 'json')
 $currentPricing = Get-WritablePricingProperties $currentPricingResource.properties
@@ -824,6 +871,7 @@ else {
         subscriptionId = $subscriptionId
         tenantId = [string]$account.tenantId
         apiServerAuthorizedIpRanges = @($ApiServerAuthorizedIpRanges)
+        kubernetesVersion = $resolvedVersion
         resourceGroupId = $resourceGroupId
         workspaceId = $workspaceId
         pricingChanged = $defenderPlanNeedsUpdate
@@ -835,6 +883,7 @@ else {
         sentinelWorkbookId = Get-StableGuid "$ownerToken|$workspaceId|workbook"
     }
 }
+if (-not $state.kubernetesVersion) { $state | Add-Member NoteProperty kubernetesVersion $resolvedVersion }
 
 if ($WhatIfPreference) {
     $sentinelPreview = if ($SkipSentinel) { 'Skip Sentinel rules and workbook' } else { 'Preflight and deploy 3 owned Sentinel rules and 1 owned workbook' }
@@ -844,7 +893,7 @@ if ($WhatIfPreference) {
 No Azure, Kubernetes, Helm, kubeconfig, or local secret-file mutations were performed.
 
 Planned changes:
-  - Deploy AKS cluster: $ProjectName (Kubernetes 1.35, 1 node, Standard_D4s_v3)
+  - Deploy AKS cluster: $ProjectName (Kubernetes $resolvedVersion, 1 node, Standard_D4s_v3)
   - Deploy workspace:   $WorkspaceName
   - Merge required Defender for Containers settings while preserving other extensions/properties
   - Replace the managed AKS Defender profile with Helm chart $DefenderHelmChartVersion
@@ -884,10 +933,11 @@ $bicepPath = Join-Path $LabRoot 'bicep/main.bicep'
 
 if ($PSCmdlet.ShouldProcess("Subscription", "Deploy Bicep template")) {
     $deployment = az deployment sub create `
+        --name "aks-$ProjectName-$Location" `
         --subscription $subscriptionId `
         --location $Location `
         --template-file $bicepPath `
-        --parameters projectName=$ProjectName location=$Location ownerToken=$ownerToken "apiServerAuthorizedIpRanges=$(ConvertTo-Json -InputObject @($ApiServerAuthorizedIpRanges) -Compress)" `
+        --parameters projectName=$ProjectName location=$Location ownerToken=$ownerToken kubernetesVersion=$resolvedVersion "apiServerAuthorizedIpRanges=$(ConvertTo-Json -InputObject @($ApiServerAuthorizedIpRanges) -Compress)" `
         --query 'properties.outputs' -o json | ConvertFrom-Json
     Assert-LastExitCode -Action 'AKS lab infrastructure deployment'
 
@@ -1033,29 +1083,9 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
         Write-Host "  Found $($staleClusterResources.Count) stale managed-sensor cluster resource(s); exact known resources will be removed before Helm." -ForegroundColor Yellow
     }
 
-    $workspaceCustomerId = az monitor log-analytics workspace show `
-        --subscription $subscriptionId `
-        --resource-group $ResourceGroup `
-        --workspace-name $WorkspaceName `
-        --query customerId `
-        --output tsv
-    Assert-LastExitCode -Action 'Log Analytics workspace ID lookup'
-    $workspaceCustomerId = [string](($workspaceCustomerId | Select-Object -First 1)).Trim()
-
-    $workspaceSharedKey = az monitor log-analytics workspace get-shared-keys `
-        --subscription $subscriptionId `
-        --resource-group $ResourceGroup `
-        --workspace-name $WorkspaceName `
-        --query primarySharedKey `
-        --output tsv
-    Assert-LastExitCode -Action 'Log Analytics workspace key lookup'
-    $workspaceSharedKey = [string](($workspaceSharedKey | Select-Object -First 1)).Trim()
-    if (-not $workspaceCustomerId -or -not $workspaceSharedKey) {
-        throw 'Log Analytics returned an empty workspace ID or shared key; refusing to deploy a sensor that cannot publish telemetry.'
-    }
-
-    # JSON is valid YAML. Keeping every Helm value in a locked-down file avoids
-    # exposing the workspace key through the process command line.
+    # The reviewed chart makes legacy workspace credentials optional. Use its
+    # identity-based publication path, consistent with current Helm guidance.
+    # JSON is valid YAML; retain the private temporary-file boundary for values.
     $helmValuesObject = @{
         global = @{
             cloudIdentifiers = @{
@@ -1070,12 +1100,6 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
         'microsoft-defender-for-containers-sensor' = @{
             antimalwareCollector = @{
                 enabled = $true
-            }
-            omsagent = @{
-                secret = @{
-                    wsid = $workspaceCustomerId
-                    key  = $workspaceSharedKey
-                }
             }
         }
     }
@@ -1116,7 +1140,7 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
                 --namespace mdc `
                 --create-namespace `
                 --values $temporaryValues.Path `
-                --atomic `
+                $helmRollbackArgument `
                 --wait `
                 --timeout 10m
             Assert-LastExitCode -Action 'Defender sensor Helm deployment'
@@ -1142,7 +1166,6 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
         }
     }
     finally {
-        $workspaceSharedKey = $null
         Remove-SecureHelmValuesFile -TemporaryValues $temporaryValues
     }
 
@@ -1204,7 +1227,7 @@ if (-not $SkipSentinel) {
             name     = 'LAB - Binary Drift in Production Namespace'
             severity = 'High'
             query    = @'
-union isfuzzy=true (datatable(TimeGenerated:datetime,AlertType:string,AlertName:string,Entities:string,ExtendedProperties:string,CompromisedEntity:string,AlertSeverity:string)[]), (SecurityAlert)
+union isfuzzy=true (datatable(TimeGenerated:datetime,AlertType:string,AlertName:string,Entities:string,ExtendedProperties:string,CompromisedEntity:string,AlertSeverity:string)[]), (SecurityAlert | where ingestion_time() > ago(5m))
 | where AlertType has_any ("DriftDetection", "BinaryDrift") or AlertName has "drift"
 | extend ParsedEntities = parse_json(Entities)
 | extend ExtProps = parse_json(ExtendedProperties)
@@ -1215,7 +1238,7 @@ union isfuzzy=true (datatable(TimeGenerated:datetime,AlertType:string,AlertName:
 | extend Namespace = tostring(Entity.Pod.Namespace.Name)
 | extend ClusterName = CompromisedEntity
 | extend DriftedBinary = tostring(ExtProps["Suspicious Process"])
-| where Namespace in ("default", "production", "kube-system")
+| where Namespace in ("default", "production", "kube-system", "runtime-security-tests")
 | where isnotempty(ContainerName)
 | project TimeGenerated, AlertSeverity, ClusterName, Namespace, PodName, ContainerName, DriftedBinary
 '@
@@ -1227,7 +1250,7 @@ union isfuzzy=true (datatable(TimeGenerated:datetime,AlertType:string,AlertName:
             name     = 'LAB - Container Malware Detected'
             severity = 'High'
             query    = @'
-union isfuzzy=true (datatable(TimeGenerated:datetime,AlertType:string,AlertName:string,Entities:string,ExtendedProperties:string,CompromisedEntity:string,AlertSeverity:string)[]), (SecurityAlert)
+union isfuzzy=true (datatable(TimeGenerated:datetime,AlertType:string,AlertName:string,Entities:string,ExtendedProperties:string,CompromisedEntity:string,AlertSeverity:string)[]), (SecurityAlert | where ingestion_time() > ago(5m))
 | where AlertType has "MalwareDetected" or AlertName has_any ("malware", "Malicious file")
 | extend ParsedEntities = parse_json(Entities)
 | extend ExtProps = parse_json(ExtendedProperties)
@@ -1253,6 +1276,7 @@ union isfuzzy=true (datatable(TimeGenerated:datetime,AlertType:string,AlertName:
             query    = @'
 AzureDiagnostics
 | where Category == "kube-audit"
+| where ingestion_time() > ago(5m)
 | extend RequestObject = parse_json(log_s)
 | extend Verb = tostring(RequestObject.verb)
 | extend RequestURI = tostring(RequestObject.requestURI)
@@ -1446,7 +1470,7 @@ Write-Host "`n=== Deployment Complete ===" -ForegroundColor Green
 Write-Host @"
 
 Resources deployed:
-  - AKS Cluster:    $clusterName (Kubernetes 1.35, 1 node, Standard_D4s_v3)
+  - AKS Cluster:    $clusterName (Kubernetes $resolvedVersion, 1 node, Standard_D4s_v3)
   - Defender:       Defender for Containers enabled (with AntiMalware extension)
   - Sensor:         Helm chart $DefenderHelmChartVersion (anti-malware collector enabled)
   - Workspace:      $WorkspaceName (Container Insights + Sentinel)

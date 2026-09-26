@@ -1,4 +1,4 @@
-#Requires -Version 7.4
+#Requires -Version 7.6
 
 [CmdletBinding()]
 param()
@@ -77,6 +77,10 @@ function Reset-MockState {
     $global:AksMockPartialPricingFailure = $false
     $global:AksMockPostWriteDrift = $false
     $global:AksMockDriftDuringDeployment = $false
+    $global:AksMockDefaultVersion = '1.35'
+    $global:AksMockCurrentVersion = '1.35.4'
+    $global:AksMockPolicyScenario = ''
+    $global:AksMockHelmVersion = 'v3.19.0'
     $global:AksMockPolicyTemplateExists = $false
     $global:AksMockGroupDeleteShouldFail = $false
     $global:AksMockPricingPutShouldFail = $false
@@ -154,6 +158,7 @@ function global:az {
         return
     }
     if ($arguments[0] -eq 'deployment' -and $arguments[1] -eq 'sub') {
+        if ($arguments -notcontains '--name' -or $arguments -notcontains 'kubernetesVersion=1.35.4') { throw 'Deployment omitted its name or exact recorded Kubernetes version.' }
         $ownerArgument = @($arguments | Where-Object { $_ -like 'ownerToken=*' })
         if ($ownerArgument.Count -ne 1) { throw 'Bicep deployment did not receive one ownerToken parameter.' }
         $global:AksMockOwnerToken = $ownerArgument[0].Substring('ownerToken='.Length)
@@ -168,6 +173,10 @@ function global:az {
     if ($arguments[0] -eq 'rest') {
         $urlIndex = [Array]::IndexOf($arguments, '--url')
         $url = if ($urlIndex -ge 0) { $arguments[$urlIndex + 1] } else { '' }
+        if ($restMethod -eq 'GET' -and $url -match '/policySetDefinitions/') {
+            if ($global:AksMockPolicyScenario -eq 'unreadable-initiative') { $global:LASTEXITCODE = 1; return 'ERROR: (AuthorizationFailed) Cannot inspect initiative.' }
+            return '{"properties":{"policyDefinitions":[{"policyDefinitionId":"/providers/Microsoft.Authorization/policyDefinitions/64def556-fbad-4622-930e-72d1d5589bf5"}]}}'
+        }
         if ($restMethod -eq 'GET' -and $url -match '/Microsoft.Security/pricings/Containers') {
             return Get-MockPricingResponse
         }
@@ -224,10 +233,14 @@ function global:az {
         }
         return
     }
+    if ($arguments[0] -eq 'aks' -and $arguments[1] -eq 'get-versions') {
+        return (@{ values = @(@{ version = $global:AksMockDefaultVersion; isDefault = $true; isPreview = $false; patchVersions = @{ "$global:AksMockDefaultVersion.4" = @{} } }) } | ConvertTo-Json -Depth 8 -Compress)
+    }
     if ($arguments[0] -eq 'aks' -and $arguments[1] -eq 'show') {
         return (@{
             id = "$global:AksMockResourceGroupId/providers/Microsoft.ContainerService/managedClusters/aks-runtime-lab"
             resourceUid = 'immutable-arm-id'
+            currentKubernetesVersion = $global:AksMockCurrentVersion
             fqdn = 'owned.eastus.azmk8s.io'
             apiServerAccessProfile = @{ authorizedIpRanges = @('1.1.1.1/32') }
             location = 'eastus'
@@ -240,9 +253,14 @@ function global:az {
             }
         } | ConvertTo-Json -Depth 10 -Compress)
     }
-    if ($arguments[0] -eq 'policy' -and $arguments[1] -eq 'assignment') { return '[]' }
+    if ($arguments[0] -eq 'policy' -and $arguments[1] -eq 'assignment') {
+        if ($arguments -notcontains '--filter' -or $arguments -notcontains 'atScope()') { throw 'Inherited policy assignments were not requested.' }
+        if ($global:AksMockPolicyScenario -eq 'inherited') { return '[{"id":"/providers/Microsoft.Management/managementGroups/lab/providers/Microsoft.Authorization/policyAssignments/defender","policyDefinitionId":"/providers/Microsoft.Authorization/policyDefinitions/64def556-fbad-4622-930e-72d1d5589bf5"}]' }
+        if ($global:AksMockPolicyScenario -in @('initiative', 'unreadable-initiative')) { return '[{"id":"/providers/Microsoft.Management/managementGroups/lab/providers/Microsoft.Authorization/policyAssignments/initiative","policyDefinitionId":"/providers/Microsoft.Management/managementGroups/lab/providers/Microsoft.Authorization/policySetDefinitions/defender"}]' }
+        return '[]'
+    }
     if ($arguments[0] -eq 'monitor' -and $arguments[1] -eq 'log-analytics') {
-        if ($arguments -contains 'get-shared-keys') { return $global:AksMockWorkspaceKey }
+        if ($arguments -contains 'get-shared-keys') { throw 'The identity-based sensor must never retrieve a workspace shared key.' }
         return $global:AksMockWorkspaceCustomerId
     }
     if ($arguments[0] -eq 'resource' -and $arguments[1] -eq 'list') {
@@ -295,6 +313,7 @@ function global:kubectl {
 
 function global:helm {
     $arguments = @($args | ForEach-Object { [string]$_ })
+    if ($arguments[0] -eq 'version') { $global:LASTEXITCODE = 0; return $global:AksMockHelmVersion }
     $contextIndex = [Array]::IndexOf($arguments, '--kube-context')
     if ($contextIndex -lt 0 -or $arguments[$contextIndex + 1] -ne 'verified-lab-context') {
         throw 'Helm operation followed mutable current context instead of the captured identity context.'
@@ -311,11 +330,12 @@ function global:helm {
     $global:AksMockValuesDirectory = Split-Path -Parent $valuesPath
     if (-not (Test-Path -LiteralPath $valuesPath)) { throw 'Helm values file did not exist.' }
     if (($arguments -join ' ') -like "*$global:AksMockWorkspaceKey*") { throw 'Workspace key leaked into process arguments.' }
-    if ($arguments -notcontains '--atomic') { throw 'Helm did not use --atomic.' }
+    $rollbackFlag = if ($global:AksMockHelmVersion -like 'v4.*') { '--rollback-on-failure' } else { '--atomic' }
+    if ($arguments -notcontains $rollbackFlag) { throw 'Helm did not use its supported rollback flag.' }
     $values = Get-Content -LiteralPath $valuesPath -Raw | ConvertFrom-Json
     $sensorValues = $values.'microsoft-defender-for-containers-sensor'
-    if (-not $sensorValues.omsagent.secret.wsid -or -not $sensorValues.omsagent.secret.key) {
-        throw 'Secure values file was incomplete.'
+    if ($sensorValues.omsagent -or -not $sensorValues.antimalwareCollector.enabled -or -not $values.global.cloudIdentifiers.Azure.subscriptionId) {
+        throw 'Sensor values included legacy keys or omitted required identity/antimalware settings.'
     }
     if ($global:AksMockHelmShouldFail) { $global:LASTEXITCODE = 42 }
 }
@@ -336,6 +356,9 @@ try {
     Assert-Condition ($runtimeSource -notmatch 'nginx:1\.14\.0') 'Runtime helper still relies on a stale arbitrary image tag.'
     Assert-Condition ($analyticsSource -notmatch 'GatedDeployment|Vulnerable Image Deployment Attempted') 'Standalone rules still invent a gated-deployment SecurityAlert schema.'
     Assert-Condition ($workbookSource -notmatch '"GatedDeployment"') 'Workbook still queries an undocumented gated-deployment alert type.'
+    Assert-Condition ($runtimeSource -match 'cp /bin/busybox /tmp/nlzt-drift/busybox' -and $runtimeSource -notmatch 'drift-binary.sh') 'Drift exercise must execute a copied ELF, not an in-image script interpreter.'
+    Assert-Condition ($runtimeSource -match 'nginx:1\.30-alpine@sha256:[0-9a-f]{64}') 'Runtime image lost its reviewed digest pin.'
+    Assert-Condition ($workbookSource -notmatch 'RequestURI !has') 'Workbook suppresses exec activity by namespace.'
     Assert-Condition ($analyticsSource -notmatch 'RequestURI !has "kube-system"') 'Interactive kube-system execution is still suppressed.'
     $null = $workbookSource | ConvertFrom-Json
 
@@ -389,6 +412,31 @@ try {
         try { & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -SkipSentinel *> $null } catch { $unknownError = $_ }
         Assert-Condition ($null -ne $unknownError -and $global:AksMockMutationCalls.Count -eq 0) "Unknown $unknownLevel pricing data allowed mutations."
     }
+
+    foreach ($policyCase in @('inherited', 'initiative', 'unreadable-initiative')) {
+        Reset-MockState -PricingConfigured $true
+        $global:AksMockPolicyScenario = $policyCase
+        $policyError = $null
+        try { & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -SkipSentinel *> $null } catch { $policyError = $_ }
+        Assert-Condition ($null -ne $policyError) "Policy case $policyCase did not stop sensor provisioning."
+        Assert-Condition (@($global:AksMockMutationCalls | Where-Object { $_ -match '^(az aks update|az tag update|helm upgrade)' }).Count -eq 0) "Policy case $policyCase changed the managed sensor."
+    }
+
+    Reset-MockState -PricingConfigured $true
+    $global:AksMockHelmVersion = 'v4.1.0'
+    & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -SkipSentinel *> $null
+    $recordedVersion = (Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json).kubernetesVersion
+    Assert-Condition ($recordedVersion -eq '1.35.4') 'Default GA patch was not recorded.'
+    $global:AksMockDefaultVersion = '1.36'
+    & $DeployScript -SkipSentinel *> $null
+    Assert-Condition ((Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json).kubernetesVersion -eq $recordedVersion) 'A new regional default silently upgraded an owned rerun.'
+    $versionError = $null
+    try { & $DeployScript -KubernetesVersion '1.36.4' -SkipSentinel *> $null } catch { $versionError = $_ }
+    Assert-Condition ($versionError.Exception.Message -match 'recorded Kubernetes version') 'An explicit upgrade bypassed the owned version boundary.'
+    $global:AksMockCurrentVersion = '1.36.4'
+    $versionError = $null
+    try { & $DeployScript -SkipSentinel *> $null } catch { $versionError = $_ }
+    Assert-Condition ($versionError.Exception.Message -match 'implicit upgrade or downgrade') 'A live version change allowed Bicep to restore an older version.'
 
     Reset-MockState -PricingConfigured $true
     $rangeError = $null

@@ -1,4 +1,4 @@
-#Requires -Version 7.4
+#Requires -Version 7.6
 # Exercise native stderr/argument handling with PowerShell itself, never Azure.
 $ErrorActionPreference = 'Stop'
 $source = Join-Path $PSScriptRoot '../scripts/Deploy-Lab.ps1'

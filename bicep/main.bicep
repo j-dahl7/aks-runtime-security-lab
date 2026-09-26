@@ -27,8 +27,8 @@ param nodeVmSize string = 'Standard_D4s_v3'
 @maxValue(3)
 param nodeCount int = 1
 
-@description('Kubernetes version')
-param kubernetesVersion string = '1.35'
+@description('Exact GA Kubernetes patch version resolved and recorded by Deploy-Lab.ps1')
+param kubernetesVersion string
 
 @description('Explicit operator egress IPv4 CIDRs for the public API server; validated by Deploy-Lab.ps1')
 @minLength(1)
