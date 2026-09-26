@@ -363,6 +363,12 @@ try {
     $null = $workbookSource | ConvertFrom-Json
 
     Reset-MockState
+    $global:AksMockDefaultVersion = '1.31'
+    $oldVersionError = $null
+    try { & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -SkipSentinel *> $null } catch { $oldVersionError = $_ }
+    Assert-Condition ($oldVersionError.Exception.Message -match 'No supported GA Kubernetes patch' -and $global:AksMockMutationCalls.Count -eq 0) 'AKS below 1.32 bypassed the Azure Linux 3 version floor.'
+
+    Reset-MockState
     $env:CONFIRM_SUBSCRIPTION_SCOPE = 'ENABLE-DEFENDER-FOR-CONTAINERS'
     $global:AksMockAddServerExtension = $true
     & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -SkipSentinel *> $null

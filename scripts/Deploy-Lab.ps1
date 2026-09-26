@@ -591,7 +591,7 @@ function Resolve-LabKubernetesVersion {
     $patches = @($candidates | ForEach-Object {
         if ([string]$_.version -match '^1\.[0-9]+\.[0-9]+$') { [string]$_.version }
         if ($_.patchVersions) { $_.patchVersions.PSObject.Properties.Name | Where-Object { $_ -match '^1\.[0-9]+\.[0-9]+$' } }
-    } | Where-Object { [version]$_ -ge [version]'1.31.0' } | Sort-Object { [version]$_ } -Descending -Unique)
+    } | Where-Object { [version]$_ -ge [version]'1.32.0' } | Sort-Object { [version]$_ } -Descending -Unique)
     if ($RequestedVersion) { $patches = @($patches | Where-Object { $_ -eq $RequestedVersion }) }
     if (-not $patches.Count) { throw 'No supported GA Kubernetes patch version was resolved for this region. Review az aks get-versions and provide -KubernetesVersion before deploying.' }
     return $patches[0]

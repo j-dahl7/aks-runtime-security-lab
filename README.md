@@ -205,7 +205,8 @@ before attributing an allow/deny result to a policy.
 
 First deployment resolves an exact patch from the region's default GA AKS
 version, or validates an explicit `-KubernetesVersion` against regional GA
-availability. It must be at least 1.31. The exact version is recorded in the
+availability. New deployments require at least 1.32 for this template's Azure
+Linux 3 selection (the gated feature itself requires 1.31). The exact version is recorded in the
 manifest and reused on reruns; a changing regional default never upgrades an
 owned cluster. Older manifests use the live cluster's exact version. Plan
 cluster upgrades separately before that version leaves support.
