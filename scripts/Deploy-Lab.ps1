@@ -8,7 +8,8 @@
     Deploys a complete AKS runtime security lab with Defender for Containers:
     1. AKS cluster via Bicep (no Defender security profile)
     2. Defender for Containers plan enablement (with AntiMalware extension)
-    3. Defender sensor via Helm chart (pinned 0.11.5 with anti-malware collector)
+    3. Defender sensor via Helm chart (version from -DefenderHelmChartVersion,
+       default 0.11.9, with anti-malware collector)
     4. Sentinel analytics rules (3 scheduled rules, disabled unless explicitly enabled)
     5. Sentinel workbook (Container Runtime Security Dashboard)
 
@@ -33,6 +34,15 @@
     Exact GA patch version for a new cluster. When omitted, resolve the region's
     default GA patch and record it. Owned reruns retain the recorded version.
 
+.PARAMETER DefenderHelmChartVersion
+    Published tag of the Defender for Containers Helm chart, such as 0.11.9.
+    When omitted, a first deployment installs the script default (0.11.9) and a
+    rerun keeps the chart version of the existing defender-k8s release. Pass a
+    version on a rerun to move that release to it. The registry must serve the
+    tag: Microsoft's sensor changelog also lists versions that were never
+    published as chart tags. A real deployment checks the tag before it changes
+    the sensor; -WhatIf does not contact the registry.
+
 .PARAMETER EnableSentinelRules
     Enable the three Sentinel analytics rules after query and telemetry review.
     Without this switch, the script creates or updates these lab rules disabled.
@@ -50,6 +60,10 @@
 .EXAMPLE
     ./Deploy-Lab.ps1 -Location "eastus" -ApiServerAuthorizedIpRanges '<your-public-egress-ip>/32' -SkipSentinel
     Deploy infrastructure only, skip Sentinel rules.
+
+.EXAMPLE
+    ./Deploy-Lab.ps1 -Location "eastus" -ApiServerAuthorizedIpRanges '<your-public-egress-ip>/32' -DefenderHelmChartVersion 0.11.5
+    Deploy with chart 0.11.5 instead of the script default.
 
 .EXAMPLE
     ./Deploy-Lab.ps1 -Destroy
@@ -70,6 +84,9 @@ param(
     [ValidatePattern('^1\.[0-9]+\.[0-9]+$')]
     [string]$KubernetesVersion,
 
+    [ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$')]
+    [string]$DefenderHelmChartVersion,
+
     [Parameter()]
     [switch]$SkipSentinel,
 
@@ -89,7 +106,13 @@ $WorkspaceName = "$ProjectName-law"
 $DefenderPolicyDefinitionId = '64def556-fbad-4622-930e-72d1d5589bf5'
 $DefenderHelmReleaseName = 'defender-k8s'
 $DefenderHelmChart = 'oci://mcr.microsoft.com/azuredefender/microsoft-defender-for-containers'
-$DefenderHelmChartVersion = '0.11.5'
+$DefenderHelmChartName = 'microsoft-defender-for-containers'
+# Installed only when -DefenderHelmChartVersion is omitted and no release exists.
+# Chosen on November 13, 2026 from Microsoft's sensor changelog and the
+# registry's published tags; this lab has not deployed it (see the README).
+$DefenderHelmChartDefaultVersion = '0.11.9'
+# Same grammar as the -DefenderHelmChartVersion ValidatePattern above.
+$DefenderHelmChartVersionPattern = '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$'
 $DefenderExclusionTag = 'ms_defender_e2e_discovery_exclude'
 $OwnershipTagName = 'nlzt-owner'
 $StatePath = Join-Path $LabRoot ".aks-runtime-lab-state-$ProjectName.json"
@@ -586,6 +609,21 @@ function Remove-SecureHelmValuesFile {
     }
 }
 
+function Assert-DefenderHelmChartPublished {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Version
+    )
+
+    # Read-only registry lookup; it never contacts the cluster. Microsoft's
+    # sensor changelog lists releases that were not published as chart tags, so
+    # confirm the tag before anything is changed on its behalf.
+    $null = helm show chart $DefenderHelmChart --version $Version
+    if ($LASTEXITCODE -ne 0) {
+        throw "Defender Helm chart version '$Version' could not be read from $DefenderHelmChart (Helm exit code $LASTEXITCODE). Compare the published tags and registry access, then choose a served version with -DefenderHelmChartVersion. The sensor was not changed."
+    }
+}
+
 function Resolve-LabKubernetesVersion {
     param($State, $ExistingCluster, [string]$RequestedVersion, [string]$Location, [string]$SubscriptionId)
     $recorded = [string]$State.kubernetesVersion
@@ -852,11 +890,23 @@ if ($existingResourceGroup) {
     if ($state.runtimeProof) { Assert-LiveCluster -State $state -Cluster $liveCluster }
 }
 $helmRollbackArgument = '--atomic'
+$sensorChartVersion = $null
+$verifiedChartVersion = $null
 if (-not $Destroy -and -not $WhatIfPreference) {
     $helmVersion = [string](helm version --short)
     Assert-LastExitCode -Action 'Helm version lookup'
     if ($helmVersion -notmatch '^v([34])\.') { throw 'Use a supported Helm 3 or 4 release; the installed major version could not be verified.' }
     if ($Matches[1] -eq '4') { $helmRollbackArgument = '--rollback-on-failure' }
+
+    # An explicit request or a first deployment already determines the chart
+    # version, so confirm the registry serves it before the first cloud write.
+    # A rerun without the parameter keeps the installed release's version,
+    # which is only readable after the kubeconfig context is verified (step 5).
+    if ($DefenderHelmChartVersion -or -not $existingResourceGroup) {
+        $verifiedChartVersion = if ($DefenderHelmChartVersion) { $DefenderHelmChartVersion } else { $DefenderHelmChartDefaultVersion }
+        Assert-DefenderHelmChartPublished -Version $verifiedChartVersion
+        Write-Host "  Defender Helm chart $verifiedChartVersion is served by the registry."
+    }
 }
 $resolvedVersion = Resolve-LabKubernetesVersion -State $state -ExistingCluster $liveCluster -RequestedVersion $KubernetesVersion -Location $Location -SubscriptionId $subscriptionId
 
@@ -904,6 +954,15 @@ if (-not $state.kubernetesVersion) { $state | Add-Member NoteProperty kubernetes
 
 if ($WhatIfPreference) {
     $sentinelPreview = if ($SkipSentinel) { 'Skip Sentinel rules and workbook' } else { 'Preflight and deploy 3 owned Sentinel rules and 1 owned workbook' }
+    $sensorChartPreview = if ($DefenderHelmChartVersion) {
+        "$DefenderHelmChartVersion (requested with -DefenderHelmChartVersion)"
+    }
+    elseif ($existingResourceGroup) {
+        "kept from an existing $DefenderHelmReleaseName release; $DefenderHelmChartDefaultVersion (script default) when none is installed"
+    }
+    else {
+        "$DefenderHelmChartDefaultVersion (script default)"
+    }
     Write-Host "`n=== Deployment Preview Only ===" -ForegroundColor Yellow
     Write-Host @"
 
@@ -913,7 +972,9 @@ Planned changes:
   - Deploy AKS cluster: $ProjectName (Kubernetes $resolvedVersion, 1 node, Standard_D4s_v3)
   - Deploy workspace:   $WorkspaceName
   - Merge required Defender for Containers settings while preserving other extensions/properties
-  - Replace the managed AKS Defender profile with Helm chart $DefenderHelmChartVersion
+  - Replace the managed AKS Defender profile with the Defender Helm chart
+    Chart version: $sensorChartPreview
+    (this preview does not ask the registry whether that version is published)
   - Enable the Helm anti-malware collector
   - $sentinelPreview
 
@@ -1081,7 +1142,7 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
         @((($helmReleaseJson -join "`n") | ConvertFrom-Json))
     }
     $defenderReleases = @($helmReleases | Where-Object {
-        $_.chart -like 'microsoft-defender-for-containers-*'
+        $_.chart -like "$DefenderHelmChartName-*"
     })
     $conflictingReleases = @($defenderReleases | Where-Object {
         $_.name -ne $DefenderHelmReleaseName
@@ -1090,9 +1151,10 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
         throw ('A Defender Helm release already exists under a different name: {0}. Reuse or remove that release before continuing.' -f (($conflictingReleases.name | Sort-Object -Unique) -join ', '))
     }
 
-    $currentReleaseExists = @($defenderReleases | Where-Object {
+    $currentRelease = @($defenderReleases | Where-Object {
         $_.name -eq $DefenderHelmReleaseName
-    }).Count -gt 0
+    })
+    $currentReleaseExists = $currentRelease.Count -gt 0
     $staleClusterResources = @(if (-not $currentReleaseExists) {
         Get-StaleDefenderClusterResources -Context $identity.context
     })
@@ -1100,8 +1162,39 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
         Write-Host "  Found $($staleClusterResources.Count) stale managed-sensor cluster resource(s); exact known resources will be removed before Helm." -ForegroundColor Yellow
     }
 
-    # The reviewed chart makes legacy workspace credentials optional. Use its
-    # identity-based publication path, consistent with current Helm guidance.
+    # An omitted -DefenderHelmChartVersion keeps the installed chart version, so
+    # a changed script default never upgrades or downgrades an owned sensor.
+    $installedChartVersion = if ($currentReleaseExists) {
+        ([string]$currentRelease[0].chart).Substring($DefenderHelmChartName.Length + 1)
+    }
+    if ($DefenderHelmChartVersion) {
+        $sensorChartVersion = $DefenderHelmChartVersion
+        if ($currentReleaseExists -and $installedChartVersion -ne $sensorChartVersion) {
+            Write-Host "  Sensor chart: moving the installed release from $installedChartVersion to the requested $sensorChartVersion." -ForegroundColor Yellow
+        }
+    }
+    elseif ($currentReleaseExists) {
+        if ($installedChartVersion -notmatch $DefenderHelmChartVersionPattern) {
+            throw "The existing '$DefenderHelmReleaseName' Helm release does not report a recognizable chart version. Review 'helm list --namespace mdc' and pass -DefenderHelmChartVersion explicitly."
+        }
+        $sensorChartVersion = $installedChartVersion
+        if ($sensorChartVersion -ne $DefenderHelmChartDefaultVersion) {
+            Write-Host "  Sensor chart: keeping the installed $sensorChartVersion (script default: $DefenderHelmChartDefaultVersion); pass -DefenderHelmChartVersion to change it." -ForegroundColor Yellow
+        }
+        else {
+            Write-Host "  Sensor chart: keeping the installed $sensorChartVersion." -ForegroundColor Gray
+        }
+    }
+    else {
+        $sensorChartVersion = $DefenderHelmChartDefaultVersion
+    }
+    if ($sensorChartVersion -ne $verifiedChartVersion) {
+        Assert-DefenderHelmChartPublished -Version $sensorChartVersion
+    }
+
+    # The reviewed 0.11.5 chart makes legacy workspace credentials optional, and
+    # Microsoft's current Helm guidance installs the chart without them. Use that
+    # identity-based publication path for whichever version is selected.
     # JSON is valid YAML; retain the private temporary-file boundary for values.
     $helmValuesObject = @{
         global = @{
@@ -1153,7 +1246,7 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
             helm upgrade --install $DefenderHelmReleaseName `
                 $DefenderHelmChart `
                 --kube-context $identity.context `
-                --version $DefenderHelmChartVersion `
+                --version $sensorChartVersion `
                 --namespace mdc `
                 --create-namespace `
                 --values $temporaryValues.Path `
@@ -1186,7 +1279,7 @@ if ($PSCmdlet.ShouldProcess($clusterName, "Deploy Defender sensor via Helm")) {
         Remove-SecureHelmValuesFile -TemporaryValues $temporaryValues
     }
 
-    Write-Host "  Defender sensor: Deployed via Helm chart $DefenderHelmChartVersion (with anti-malware)" -ForegroundColor Green
+    Write-Host "  Defender sensor: Deployed via Helm chart $sensorChartVersion (with anti-malware)" -ForegroundColor Green
 
     # Wait for sensor pods to come up
     Write-Host "  Waiting for Defender sensor pods..." -ForegroundColor Gray
@@ -1483,13 +1576,19 @@ elseif ($EnableSentinelRules) {
 else {
     '3 disabled owned analytics rules + 1 owned workbook (review before enabling)'
 }
+$sensorSummary = if ($sensorChartVersion) {
+    "Helm chart $sensorChartVersion (anti-malware collector enabled)"
+}
+else {
+    'Helm step was not run'
+}
 Write-Host "`n=== Deployment Complete ===" -ForegroundColor Green
 Write-Host @"
 
 Resources deployed:
   - AKS Cluster:    $clusterName (Kubernetes $resolvedVersion, 1 node, Standard_D4s_v3)
   - Defender:       Defender for Containers enabled (with AntiMalware extension)
-  - Sensor:         Helm chart $DefenderHelmChartVersion (anti-malware collector enabled)
+  - Sensor:         $sensorSummary
   - Workspace:      $WorkspaceName (Container Insights + Sentinel)
   - Sentinel:       $sentinelSummary
 

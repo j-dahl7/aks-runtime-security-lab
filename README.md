@@ -12,12 +12,20 @@ Companion lab for the blog post: [AKS Runtime Security: Binary Drift, Anti-Malwa
 
 ## Validation Boundary
 
-The September 25, 2026 repair revision was checked with Bicep compilation,
-PowerShell parsing, and mocked safety/rollback tests. It was not freshly
-deployed to Azure, and no live AKS, Defender, Helm, Sentinel, or alert-ingestion
-validation was performed for this revision. Feature availability, policy
-behavior, chart availability, and alert latency can vary by
-subscription, region, and cluster version.
+Offline checks only, November 13, 2026: this revision makes the Defender Helm
+chart version selectable and, on a first deployment, installs `0.11.9` by
+default instead of the fixed `0.11.5`. It was checked with Bicep compilation
+(Bicep CLI 0.45.6), PowerShell parsing, and the three mocked safety/rollback
+suites below. Helm was not installed where those checks ran. Chart `0.11.9`
+was not pulled, inspected, or deployed, and no tenant, cluster, or cloud test
+was run.
+
+The September 25, 2026 repair revision was checked the same way: Bicep
+compilation, PowerShell parsing, and mocked safety/rollback tests. Neither
+revision was freshly deployed to Azure, and no live AKS, Defender, Helm,
+Sentinel, or alert-ingestion validation was performed for either. Feature
+availability, policy behavior, chart availability, and alert latency can vary
+by subscription, region, and cluster version.
 
 Run the offline deployment-safety harness from a fresh checkout:
 
@@ -28,9 +36,12 @@ pwsh -NoProfile -File tests/Test-AzJson.ps1
 ```
 
 It mocks Azure CLI, Kubernetes, and Helm to exercise ownership refusal, exact
-stale-resource cleanup, `-WhatIf`, pricing/profile rollback, readiness, and
-default-disabled/explicitly-enabled rules. It refuses to run over an existing
-ownership manifest. Passing this harness is not a live cluster or sensor test.
+stale-resource cleanup, `-WhatIf`, pricing/profile rollback, readiness,
+Defender chart-version selection and refusal of unpublished tags, and
+default-disabled/explicitly-enabled rules. Its mocked registry serves the GA
+`0.11` chart tags listed below and never contacts MCR. It refuses to run over
+an existing ownership manifest. Passing this harness is not a live cluster or
+sensor test.
 The separate `validate.yml` pull-request workflow compiles Bicep and runs these
 mocks without cloud credentials, deployment steps, or schedules.
 
@@ -51,21 +62,70 @@ extensions at subscription scope. If the required state is not already active,
 the real deployment requires the exact environment confirmation
 `CONFIRM_SUBSCRIPTION_SCOPE=ENABLE-DEFENDER-FOR-CONTAINERS`.
 
-The script pins Defender's OCI Helm chart to `0.11.5` after reviewing its published chart and August security fixes.
-It is not a claim that `0.11.5` is the newest release or
-compatible with every future AKS/Defender combination. Before a live run,
-confirm that the publisher still serves the pin and review its supported
-Kubernetes/Defender matrix:
-
-The retained `0.11.5` archive was checked against OCI layer digest
-`sha256:30a95ffed15dcd07b5789bb53c8ab6ae4f93946e16beee075375ecf7c8f08c9a`;
-its helpers explicitly make workspace ID/key optional. Microsoft's current
-changelog also lists sensor `0.11.6`; this review could not refresh MCR's tag
-listing, so no unverified chart tag or fresh sensor deployment is claimed.
+The script installs Defender's OCI Helm chart at the version selected by
+`-DefenderHelmChartVersion`. When the parameter is omitted, a first deployment
+installs `0.11.9`, and a rerun keeps the chart version of the existing
+`defender-k8s` release, so a changed script default never moves an owned
+sensor. An owned lab deployed by an earlier revision (which pinned `0.11.4`
+from July 26, 2026 and `0.11.5` from September 25, 2026) therefore stays on
+that chart, without the later security updates, until you choose otherwise.
+Pass the parameter to choose another published version, on a first deployment
+or on a rerun that should move the existing release:
 
 ```powershell
-helm show chart oci://mcr.microsoft.com/azuredefender/microsoft-defender-for-containers --version 0.11.5
+# First deployment on 0.11.5, the last chart whose archive this lab reviewed
+./scripts/Deploy-Lab.ps1 -Location "eastus" -ProjectName "aks-runtime-lab" -ApiServerAuthorizedIpRanges '<your-public-egress-ip>/32' -DefenderHelmChartVersion 0.11.5
+
+# Owned rerun that moves the existing release to 0.11.9
+./scripts/Deploy-Lab.ps1 -Location "eastus" -ProjectName "aks-runtime-lab" -DefenderHelmChartVersion 0.11.9
 ```
+
+The default is the newest `0.11` chart tag the registry listed on November 13,
+2026. That is not a claim that it stays the newest release or is compatible
+with every future AKS/Defender combination. It was chosen from Microsoft's
+documentation and the registry's tag list, not from a deployment:
+
+- Microsoft's [sensor changelog](https://learn.microsoft.com/en-us/azure/defender-for-cloud/defender-sensor-change-log)
+  (page updated October 26, 2026) lists `0.11.6`, `0.11.7`, and `0.11.8` as
+  security and dependency updates, and `0.11.9`, released in October 2026, as
+  removing trust in certificate authorities affected by the eMudhra compromise.
+  It names no change to chart values or installation steps after `0.11.5`.
+- The values this script sets, `global.cloudIdentifiers.Azure.*` and
+  `microsoft-defender-for-containers-sensor.antimalwareCollector.enabled`, are
+  the ones Microsoft's current [Helm](https://learn.microsoft.com/en-us/azure/defender-for-cloud/deploy-helm)
+  and [anti-malware](https://learn.microsoft.com/en-us/azure/defender-for-cloud/anti-malware)
+  guidance documents.
+- MCR's tag list, read on November 13, 2026, served these 0.11 chart tags:
+  `0.11.3-preview`, `0.11.4`, `0.11.5`, `0.11.8`, and `0.11.9`. Sensor `0.11.6`
+  and `0.11.7` are in the changelog but were not among the chart tags, so
+  choose a version from the tag list, not from the changelog alone.
+
+This lab's own tests did not deploy `0.11.9`, and its chart archive was not
+pulled or inspected: this review could not connect to MCR directly and read
+the tag list through a hosted fetch service. The last chart whose archive was
+source-reviewed is `0.11.5`. The September 25, 2026 review checked that
+retained archive against OCI layer digest
+`sha256:30a95ffed15dcd07b5789bb53c8ab6ae4f93946e16beee075375ecf7c8f08c9a`;
+its helpers explicitly make workspace ID/key optional. Pass
+`-DefenderHelmChartVersion 0.11.5` on a first deployment to use that reviewed
+chart instead, which lacks the later security updates.
+
+Before a live run, list the published tags, confirm that the publisher still
+serves the version you chose, and review its supported Kubernetes/Defender
+matrix:
+
+```powershell
+curl https://mcr.microsoft.com/v2/azuredefender/microsoft-defender-for-containers/tags/list
+helm show chart oci://mcr.microsoft.com/azuredefender/microsoft-defender-for-containers --version 0.11.9
+```
+
+A real deployment runs the same `helm show chart` lookup and stops if the
+registry does not serve the version. The lookup happens before the first cloud
+write when the version is already known (a first deployment, or an explicit
+`-DefenderHelmChartVersion`), and otherwise before the sensor is changed.
+`-WhatIf` does not contact the registry. If a version change fails, the
+script's Helm rollback flag and protection-state restore apply; Microsoft's
+Helm guidance covers upgrade failures caused by resource conflicts.
 
 A Helm-managed sensor is not upgraded automatically; the operator owns chart
 review and upgrades. Microsoft also notes that the portal can label a
@@ -142,9 +202,10 @@ Run the test scenarios after the ownership-verified deployment:
 ./scripts/Test-RuntimeSecurity.ps1 -ProjectName "aks-runtime-lab" -Namespace "runtime-security-tests"
 ```
 
-Deployment parameters are `-Location`, `-ProjectName`, `-ApiServerAuthorizedIpRanges`, `-SkipSentinel`,
-`-EnableSentinelRules`, `-Destroy`, and PowerShell's common `-WhatIf` switch. The test helper accepts
-`-ProjectName`, `-Namespace`, `-SkipDrift`, `-SkipMalware`, and `-SkipGated`.
+Deployment parameters are `-Location`, `-ProjectName`, `-ApiServerAuthorizedIpRanges`,
+`-KubernetesVersion`, `-DefenderHelmChartVersion`, `-SkipSentinel`, `-EnableSentinelRules`,
+`-Destroy`, and PowerShell's common `-WhatIf` switch. The test helper accepts
+`-ProjectName`, `-Namespace`, `-SkipDrift`, `-SkipMalware`, `-SkipGated`, and `-GatedTestImage`.
 
 The test helper verifies the active tenant/subscription, resource-group owner,
 ARM resource ID and immutable resourceUID, API allowlist, kubeconfig server/CA,
@@ -168,7 +229,7 @@ The local manifest is trusted operator state, not a tamper-proof attestation.
 
 Gated deployment requires Kubernetes 1.31 or later, OIDC on AKS, Defender
 sensor with Security Gating, Registry access with Security findings, and
-vulnerability findings artifacts for evaluated images. The lab deploys AKS
+vulnerability findings artifacts for evaluated images. The lab deploys AKS on
 a supported GA version with OIDC, but you must verify every service-side prerequisite and artifact
 before attributing an allow/deny result to a policy.
 
@@ -177,7 +238,7 @@ before attributing an allow/deny result to a policy.
 | Resource | Type | Purpose |
 |---|---|---|
 | `aks-runtime-lab` | AKS Cluster | Single-node cluster (Standard_D4s_v3) |
-| Defender Sensor | Helm Chart | Source-reviewed pin `0.11.5` with anti-malware collector (`mdc` namespace) |
+| Defender Sensor | Helm Chart | Release `defender-k8s`: chart `0.11.9` on a first deployment unless `-DefenderHelmChartVersion` selects another; reruns keep the installed chart. Anti-malware collector enabled (`mdc` namespace) |
 | `aks-runtime-lab-law` | Log Analytics | Container Insights + Microsoft Sentinel |
 | Defender for Containers | Security Plan | Subscription-level enablement |
 | 3 Analytics Rules | Sentinel | Binary drift, malware, kubectl exec |
@@ -186,21 +247,31 @@ before attributing an allow/deny result to a policy.
 ## Repository Structure
 
 ```
-â”œâ”€â”€ bicep/
-â”‚   â”œâ”€â”€ main.bicep                  # Subscription-scoped orchestrator
-â”‚   â””â”€â”€ modules/
-â”‚       â”œâ”€â”€ aks.bicep               # AKS cluster + diagnostics (sensor via Helm)
-â”‚       â””â”€â”€ monitoring.bicep        # Log Analytics + Sentinel + Container Insights
-â”œâ”€â”€ detection/
-â”‚   â”œâ”€â”€ analytics-rules.kql         # 3 Sentinel analytics rules
-â”‚   â””â”€â”€ hunting-queries.kql         # 3 proactive hunting queries
-â”œâ”€â”€ scripts/
-â”‚   â”œâ”€â”€ Deploy-Lab.ps1              # One-command deployment
-â”‚   â””â”€â”€ Test-RuntimeSecurity.ps1    # 3 test scenarios
-â”œâ”€â”€ tests/
-â”‚   â””â”€â”€ Test-DeployLabSafety.ps1    # Offline Azure/Kubernetes/Helm safety mocks
-â””â”€â”€ workbook/
-    â””â”€â”€ container-runtime-workbook.json  # Container Runtime Security Dashboard
+.
+|-- .github/
+|   `-- workflows/
+|       `-- validate.yml                 # Offline CI: Bicep build, parsing, mocked tests
+|-- bicep/
+|   |-- main.bicep                       # Subscription-scoped orchestrator
+|   `-- modules/
+|       |-- aks.bicep                    # AKS cluster + diagnostics (sensor via Helm)
+|       `-- monitoring.bicep             # Log Analytics + Sentinel + Container Insights
+|-- detection/
+|   |-- analytics-rules.kql              # 3 Sentinel analytics rules
+|   `-- hunting-queries.kql              # 3 proactive hunting queries
+|-- scripts/
+|   |-- Cluster-Identity.ps1             # Shared ownership and cluster-identity checks
+|   |-- Deploy-Lab.ps1                   # One-command deployment
+|   `-- Test-RuntimeSecurity.ps1         # 3 test scenarios
+|-- tests/
+|   |-- Test-AzJson.ps1                  # Offline Azure CLI output and error-handling checks
+|   |-- Test-DeployLabSafety.ps1         # Offline Azure/Kubernetes/Helm safety mocks
+|   `-- Test-RuntimeSafety.ps1           # Offline ownership mocks for the test helper
+|-- workbook/
+|   `-- container-runtime-workbook.json  # Container Runtime Security Dashboard
+|-- .gitignore                           # Keeps local ownership manifests out of Git
+|-- LICENSE
+`-- README.md
 ```
 
 First deployment resolves an exact patch from the region's default GA AKS
@@ -368,6 +439,7 @@ representative profiling before adding filters that might drop encoded input.
 - [Microsoft: Kubernetes Gated Deployment](https://learn.microsoft.com/en-us/azure/defender-for-cloud/enablement-guide-runtime-gated)
 - [Microsoft: Troubleshoot Gated Deployment](https://learn.microsoft.com/en-us/azure/defender-for-cloud/troubleshooting-runtime-gated)
 - [Microsoft: Install the Defender sensor with Helm](https://learn.microsoft.com/en-us/azure/defender-for-cloud/deploy-helm)
+- [Microsoft: Defender sensor changelog](https://learn.microsoft.com/en-us/azure/defender-for-cloud/defender-sensor-change-log)
 - [Microsoft: Defender for Cloud Attack Simulation](https://github.com/microsoft/Defender-for-Cloud-Attack-Simulation)
 - [MITRE ATT&CK: Containers Matrix](https://attack.mitre.org/matrices/enterprise/containers/)
 

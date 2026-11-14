@@ -9,6 +9,7 @@ $DeployScript = Join-Path $Root 'scripts/Deploy-Lab.ps1'
 $RuntimeTestScript = Join-Path $Root 'scripts/Test-RuntimeSecurity.ps1'
 $AnalyticsRules = Join-Path $Root 'detection/analytics-rules.kql'
 $Workbook = Join-Path $Root 'workbook/container-runtime-workbook.json'
+$Readme = Join-Path $Root 'README.md'
 $StatePath = Join-Path $Root '.aks-runtime-lab-state-aks-runtime-lab.json'
 if (Test-Path -LiteralPath $StatePath) {
     throw 'Refusing to run the mocked safety harness over an existing ownership manifest. Use a fresh checkout.'
@@ -86,6 +87,10 @@ function Reset-MockState {
     $global:AksMockPricingPutShouldFail = $false
     $global:AksMockGroupExistsShouldFail = $false
     $global:AksMockCliSubscriptionId = $global:AksMockSubscriptionId
+    $global:AksMockInstalledChartVersion = $null
+    # 0.11 chart tags the registry served on November 13, 2026. Microsoft's
+    # changelog also lists sensor 0.11.6 and 0.11.7, which were never chart tags.
+    $global:AksMockPublishedChartVersions = @('0.11.4', '0.11.5', '0.11.8', '0.11.9')
 }
 
 function Get-MockPricingResponse {
@@ -155,6 +160,7 @@ function global:az {
         }
         if ($global:AksMockGroupDeleteShouldFail) { $global:LASTEXITCODE = 42; return 'simulated delete failure' }
         $global:AksMockResourceGroupExists = $false
+        $global:AksMockInstalledChartVersion = $null
         return
     }
     if ($arguments[0] -eq 'deployment' -and $arguments[1] -eq 'sub') {
@@ -314,14 +320,38 @@ function global:kubectl {
 function global:helm {
     $arguments = @($args | ForEach-Object { [string]$_ })
     if ($arguments[0] -eq 'version') { $global:LASTEXITCODE = 0; return $global:AksMockHelmVersion }
+    $versionIndex = [Array]::IndexOf($arguments, '--version')
+    $chartVersion = if ($versionIndex -ge 0) { $arguments[$versionIndex + 1] } else { $null }
+    if ($arguments[0] -eq 'show') {
+        # Registry lookup only: no cluster context, never a mutation.
+        Add-MockCall -Command ('helm ' + ($arguments -join ' '))
+        if (($arguments -join ' ') -cne "show chart oci://mcr.microsoft.com/azuredefender/microsoft-defender-for-containers --version $chartVersion") {
+            throw 'Unexpected Helm registry lookup.'
+        }
+        if ($chartVersion -notin $global:AksMockPublishedChartVersions) { $global:LASTEXITCODE = 1; return }
+        $global:LASTEXITCODE = 0
+        return "apiVersion: v2`nname: microsoft-defender-for-containers`nversion: $chartVersion"
+    }
     $contextIndex = [Array]::IndexOf($arguments, '--kube-context')
     if ($contextIndex -lt 0 -or $arguments[$contextIndex + 1] -ne 'verified-lab-context') {
         throw 'Helm operation followed mutable current context instead of the captured identity context.'
     }
     Add-MockCall -Command ('helm ' + ($arguments -join ' ')) -Mutation:($arguments[0] -eq 'upgrade')
     $global:LASTEXITCODE = 0
-    if ($arguments[0] -eq 'list') { return '[]' }
+    if ($arguments[0] -eq 'list') {
+        if (-not $global:AksMockInstalledChartVersion) { return '[]' }
+        return (ConvertTo-Json -Compress -InputObject @(@{
+            name = 'defender-k8s'
+            namespace = 'mdc'
+            status = 'deployed'
+            chart = "microsoft-defender-for-containers-$global:AksMockInstalledChartVersion"
+        }))
+    }
     if ($arguments[0] -ne 'upgrade') { return }
+    if (-not $chartVersion) { throw 'Helm was not given an exact chart version.' }
+    if ($chartVersion -notin $global:AksMockPublishedChartVersions) {
+        throw "Helm was asked to install a chart version the registry lookup should have refused first: '$chartVersion'"
+    }
 
     $valuesIndex = [Array]::IndexOf($arguments, '--values')
     if ($valuesIndex -lt 0) { throw 'Helm was not given a values file.' }
@@ -337,7 +367,8 @@ function global:helm {
     if ($sensorValues.omsagent -or -not $sensorValues.antimalwareCollector.enabled -or -not $values.global.cloudIdentifiers.Azure.subscriptionId) {
         throw 'Sensor values included legacy keys or omitted required identity/antimalware settings.'
     }
-    if ($global:AksMockHelmShouldFail) { $global:LASTEXITCODE = 42 }
+    if ($global:AksMockHelmShouldFail) { $global:LASTEXITCODE = 42; return }
+    $global:AksMockInstalledChartVersion = $chartVersion
 }
 
 function global:Start-Sleep { param() }
@@ -345,6 +376,17 @@ function global:Start-Sleep { param() }
 try {
     $enableHelp = Get-Help $DeployScript -Parameter EnableSentinelRules | Out-String
     Assert-Condition ($enableHelp -match 'Without this switch' -and $enableHelp -match 'disabled') 'Get-Help does not explain default-disabled Sentinel rules.'
+    $deploySource = Get-Content -LiteralPath $DeployScript -Raw
+    Assert-Condition ($deploySource -match "(?m)^\`$DefenderHelmChartDefaultVersion = '(?<version>[0-9]+\.[0-9]+\.[0-9]+)'\r?$") 'Deploy script lacks one exact default Defender chart version.'
+    $defaultChartVersion = $Matches.version
+    $olderChartVersion = '0.11.5'
+    Assert-Condition ($defaultChartVersion -ne $olderChartVersion) 'Chart fixtures need an explicit version that differs from the script default.'
+    Reset-MockState
+    Assert-Condition ($defaultChartVersion -in $global:AksMockPublishedChartVersions) 'The script default chart version is not in the mocked registry tag list. Confirm the registry serves it, then update the fixture.'
+    $chartHelp = (Get-Help $DeployScript -Parameter DefenderHelmChartVersion | Out-String) -replace '\s+', ' '
+    Assert-Condition ($chartHelp -match "script default \($([regex]::Escape($defaultChartVersion))\)" -and $chartHelp -match 'rerun keeps the chart version') 'Get-Help does not explain the chart default and rerun behavior.'
+    $readmeSource = (Get-Content -LiteralPath $Readme -Raw) -replace '\s+', ' '
+    Assert-Condition ($readmeSource -match '`-DefenderHelmChartVersion`' -and $readmeSource -match "first deployment installs ``$([regex]::Escape($defaultChartVersion))``") 'README does not document the chart parameter with the script default.'
     $runtimeSource = Get-Content -LiteralPath $RuntimeTestScript -Raw
     $analyticsSource = Get-Content -LiteralPath $AnalyticsRules -Raw
     $workbookSource = Get-Content -LiteralPath $Workbook -Raw
@@ -587,7 +629,79 @@ try {
     $postCollisionSentinelWrites = @($global:AksMockMutationCalls | Where-Object { $_ -match 'dataConnectors|alertRules|workbooks' -and $_ -match '--method PUT' })
     Assert-Condition ($postCollisionSentinelWrites.Count -eq 0) 'Workbook collision allowed a partial Sentinel write.'
 
-    Write-Host 'PASS: ownership, pricing rollback, readiness, and Sentinel fail-closed tests passed.' -ForegroundColor Green
+    # Defender Helm chart version: default, explicit choice, owned reruns, and
+    # versions the registry does not serve.
+    $chartLookup = 'helm show chart oci://mcr.microsoft.com/azuredefender/microsoft-defender-for-containers --version'
+    $sensorMutation = '^(az aks update|az tag update|kubectl delete|helm upgrade)'
+
+    Reset-MockState -PricingConfigured $true
+    $defaultChartOutput = & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -SkipSentinel 6>&1 | Out-String
+    $helmUpgrades = @($global:AksMockMutationCalls | Where-Object { $_ -like 'helm upgrade *' })
+    Assert-Condition ($helmUpgrades.Count -eq 1 -and $helmUpgrades[0] -match " --version $([regex]::Escape($defaultChartVersion)) ") 'First deployment did not install the documented default chart version.'
+    $lookupIndex = $global:AksMockExternalCalls.IndexOf("$chartLookup $defaultChartVersion")
+    $firstMutationIndex = $global:AksMockExternalCalls.IndexOf($global:AksMockMutationCalls[0])
+    Assert-Condition ($lookupIndex -ge 0 -and $lookupIndex -lt $firstMutationIndex) 'The default chart version was not confirmed with the registry before the first mutation.'
+    Assert-Condition (@($global:AksMockExternalCalls | Where-Object { $_ -like "$chartLookup *" }).Count -eq 1) 'A confirmed chart version was looked up again.'
+    Assert-Condition ($defaultChartOutput -match "Helm chart $([regex]::Escape($defaultChartVersion)) \(anti-malware collector enabled\)") 'Summary did not report the deployed chart version.'
+
+    Reset-MockState -PricingConfigured $true
+    & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -SkipSentinel -DefenderHelmChartVersion $olderChartVersion *> $null
+    Assert-Condition ($global:AksMockInstalledChartVersion -eq $olderChartVersion) 'An explicit chart version was not installed.'
+    $keptChartOutput = & $DeployScript -SkipSentinel 6>&1 | Out-String
+    Assert-Condition ($global:AksMockInstalledChartVersion -eq $olderChartVersion -and $keptChartOutput -match "keeping the installed $([regex]::Escape($olderChartVersion))") 'A rerun without the parameter replaced the installed chart version with the script default.'
+    Assert-Condition ($keptChartOutput -match "Helm chart $([regex]::Escape($olderChartVersion)) \(anti-malware collector enabled\)") 'Rerun summary did not report the kept chart version.'
+    $movedChartOutput = & $DeployScript -SkipSentinel -DefenderHelmChartVersion $defaultChartVersion 6>&1 | Out-String
+    Assert-Condition ($global:AksMockInstalledChartVersion -eq $defaultChartVersion -and $movedChartOutput -match "from $([regex]::Escape($olderChartVersion)) to the requested $([regex]::Escape($defaultChartVersion))") 'An explicit chart version on an owned rerun did not move the release.'
+
+    # 0.11.7 is in Microsoft's sensor changelog but was never a chart tag.
+    Reset-MockState
+    $env:CONFIRM_SUBSCRIPTION_SCOPE = 'ENABLE-DEFENDER-FOR-CONTAINERS'
+    $chartError = $null
+    try { & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -SkipSentinel -DefenderHelmChartVersion '0.11.7' *> $null } catch { $chartError = $_ }
+    Assert-Condition ($chartError.Exception.Message -match "version '0\.11\.7' could not be read") 'A chart version the registry does not serve was not refused.'
+    Assert-Condition ($global:AksMockMutationCalls.Count -eq 0 -and -not (Test-Path -LiteralPath $StatePath)) 'An unpublished chart version allowed a mutation or wrote a manifest.'
+
+    Reset-MockState -PricingConfigured $true
+    & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -SkipSentinel *> $null
+    $beforeRefusedChart = $global:AksMockMutationCalls.Count
+    $chartError = $null
+    try { & $DeployScript -SkipSentinel -DefenderHelmChartVersion '0.11.6' *> $null } catch { $chartError = $_ }
+    Assert-Condition ($chartError.Exception.Message -match "version '0\.11\.6' could not be read" -and $global:AksMockMutationCalls.Count -eq $beforeRefusedChart) 'An unpublished chart version changed an owned deployment.'
+    # The publisher withdraws the installed version: the rerun must stop before
+    # it touches the managed profile, the exclusion tag, or the release.
+    $global:AksMockPublishedChartVersions = @($global:AksMockPublishedChartVersions | Where-Object { $_ -ne $defaultChartVersion })
+    $chartError = $null
+    try { & $DeployScript -SkipSentinel *> $null } catch { $chartError = $_ }
+    $withdrawnChartCalls = @($global:AksMockMutationCalls | Select-Object -Skip $beforeRefusedChart)
+    Assert-Condition ($chartError.Exception.Message -match "version '$([regex]::Escape($defaultChartVersion))' could not be read") 'A withdrawn installed chart version was not refused.'
+    Assert-Condition (@($withdrawnChartCalls | Where-Object { $_ -match $sensorMutation }).Count -eq 0 -and $global:AksMockInstalledChartVersion -eq $defaultChartVersion) 'A withdrawn installed chart version still changed the sensor.'
+
+    Reset-MockState -PricingConfigured $true
+    & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -SkipSentinel *> $null
+    $global:AksMockInstalledChartVersion = 'sensor-unreadable build'
+    $beforeUnreadableChart = $global:AksMockMutationCalls.Count
+    $chartError = $null
+    try { & $DeployScript -SkipSentinel *> $null } catch { $chartError = $_ }
+    $unreadableChartCalls = @($global:AksMockMutationCalls | Select-Object -Skip $beforeUnreadableChart)
+    Assert-Condition ($chartError.Exception.Message -match 'recognizable chart version' -and @($unreadableChartCalls | Where-Object { $_ -match $sensorMutation }).Count -eq 0) 'An unreadable installed chart version was replaced without an explicit choice.'
+    & $DeployScript -SkipSentinel -DefenderHelmChartVersion '0.11.8' *> $null
+    Assert-Condition ($global:AksMockInstalledChartVersion -eq '0.11.8') 'An explicit chart version did not resolve an unreadable installed version.'
+
+    foreach ($badChartVersion in @('', 'latest', '0.11', 'v0.11.9', '^0.11.0', '>=0.11.5', '0.11.9+build', '0.11.9 --devel', '--devel')) {
+        Reset-MockState -PricingConfigured $true
+        $chartError = $null
+        try { & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -SkipSentinel -DefenderHelmChartVersion $badChartVersion *> $null } catch { $chartError = $_ }
+        Assert-Condition ($null -ne $chartError -and $global:AksMockExternalCalls.Count -eq 0) "Malformed chart version reached an external command: '$badChartVersion'"
+    }
+
+    Reset-MockState
+    $chartPreview = & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -WhatIf -SkipSentinel 6>&1 | Out-String
+    Assert-Condition ($chartPreview -match "Chart version: $([regex]::Escape($defaultChartVersion)) \(script default\)") 'Preview did not name the default chart version.'
+    $chartPreview = & $DeployScript -ApiServerAuthorizedIpRanges @('1.1.1.1/32') -WhatIf -SkipSentinel -DefenderHelmChartVersion '0.11.8' 6>&1 | Out-String
+    Assert-Condition ($chartPreview -match 'Chart version: 0\.11\.8 \(requested with -DefenderHelmChartVersion\)') 'Preview did not name the requested chart version.'
+    Assert-Condition ($global:AksMockMutationCalls.Count -eq 0 -and @($global:AksMockExternalCalls | Where-Object { $_ -like 'helm *' }).Count -eq 0) 'Preview mutated state or contacted the chart registry.'
+
+    Write-Host 'PASS: ownership, pricing rollback, readiness, chart-version selection, and Sentinel fail-closed tests passed.' -ForegroundColor Green
 }
 finally {
     Remove-Item -LiteralPath $StatePath -Force -ErrorAction SilentlyContinue
