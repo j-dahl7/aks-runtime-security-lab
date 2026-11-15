@@ -12,18 +12,28 @@ Companion lab for the blog post: [AKS Runtime Security: Binary Drift, Anti-Malwa
 
 ## Validation Boundary
 
-Offline checks only, November 13, 2026: this revision makes the Defender Helm
-chart version selectable and, on a first deployment, installs `0.11.9` by
-default instead of the fixed `0.11.5`. It was checked with Bicep compilation
+Offline checks only, November 14, 2026: this revision changes the layout of
+this README's command blocks and adds a check for it. Each `-WhatIf` preview,
+real deployment, paid-plan confirmation, rule enablement, and cleanup step now
+has its own block, so one paste cannot run a later step before the reader has
+read the earlier output. No README command, script, template, query, or
+workbook changed; `validate.yml` now also runs the README check. It was checked
+with Bicep compilation (Bicep CLI 0.45.6), PowerShell parsing, the README check,
+and the three mocked safety/rollback suites below; no tenant, cluster, or cloud
+test was run.
+
+Offline checks only, November 13, 2026: the revision before this one made the
+Defender Helm chart version selectable, so a first deployment installs `0.11.9`
+by default instead of the fixed `0.11.5`. It was checked with Bicep compilation
 (Bicep CLI 0.45.6), PowerShell parsing, and the three mocked safety/rollback
 suites below. Helm was not installed where those checks ran. Chart `0.11.9`
 was not pulled, inspected, or deployed, and no tenant, cluster, or cloud test
 was run.
 
 The September 25, 2026 repair revision was checked the same way: Bicep
-compilation, PowerShell parsing, and mocked safety/rollback tests. Neither
-revision was freshly deployed to Azure, and no live AKS, Defender, Helm,
-Sentinel, or alert-ingestion validation was performed for either. Feature
+compilation, PowerShell parsing, and mocked safety/rollback tests. None of
+these revisions was freshly deployed to Azure, and no live AKS, Defender, Helm,
+Sentinel, or alert-ingestion validation was performed for any of them. Feature
 availability, policy behavior, chart availability, and alert latency can vary
 by subscription, region, and cluster version.
 
@@ -42,8 +52,20 @@ default-disabled/explicitly-enabled rules. Its mocked registry serves the GA
 `0.11` chart tags listed below and never contacts MCR. It refuses to run over
 an existing ownership manifest. Passing this harness is not a live cluster or
 sensor test.
+
+The README check reads this file one fenced block at a time, as a reader copies
+it. It fails if a block holds a `-WhatIf` preview with a real run, more than one
+state-changing run of `Deploy-Lab.ps1` or `Test-RuntimeSecurity.ps1`, or the
+paid-plan confirmation with a run. It reads the scripts' parameters but never
+runs them:
+
+```powershell
+pwsh -NoProfile -File tests/Test-ReadmeCommandBlocks.ps1
+```
+
 The separate `validate.yml` pull-request workflow compiles Bicep and runs these
-mocks without cloud credentials, deployment steps, or schedules.
+mocks and the README check without cloud credentials, deployment steps, or
+schedules.
 
 ## Prerequisites
 
@@ -75,10 +97,19 @@ or on a rerun that should move the existing release:
 ```powershell
 # First deployment on 0.11.5, the last chart whose archive this lab reviewed
 ./scripts/Deploy-Lab.ps1 -Location "eastus" -ProjectName "aks-runtime-lab" -ApiServerAuthorizedIpRanges '<your-public-egress-ip>/32' -DefenderHelmChartVersion 0.11.5
+```
 
+On an owned rerun, the same parameter moves the existing release:
+
+```powershell
 # Owned rerun that moves the existing release to 0.11.9
 ./scripts/Deploy-Lab.ps1 -Location "eastus" -ProjectName "aks-runtime-lab" -DefenderHelmChartVersion 0.11.9
 ```
+
+Every run without `-SkipSentinel`, a rerun included, writes the lab's three
+Sentinel rules again from the script, with their stored queries. If you enabled
+the rules, add `-EnableSentinelRules` to the rerun, or they return to disabled.
+Add `-SkipSentinel` instead to leave the rules and the workbook as they are.
 
 The default is the newest `0.11` chart tag the registry listed on November 13,
 2026. That is not a claim that it stays the newest release or is compatible
@@ -149,6 +180,8 @@ git clone https://github.com/j-dahl7/aks-runtime-security-lab.git
 cd aks-runtime-security-lab
 ```
 
+Preview the deployment:
+
 ```powershell
 # Read-only preview. This reports intended operations and performs no Azure,
 # Kubernetes, Helm, kubeconfig, or local secret-file mutations.
@@ -161,16 +194,21 @@ Verify the active subscription and current shared plan before the real run:
 ```powershell
 az account show --query '{subscription:name,id:id}' -o table
 az security pricing show --name Containers -o json
+```
 
+Set the paid-plan confirmation only when it is required:
+
+```powershell
 # Required only when the script reports that the shared plan/extensions need
 # to change:
 $env:CONFIRM_SUBSCRIPTION_SCOPE = 'ENABLE-DEFENDER-FOR-CONTAINERS'
+```
 
+Read the preview output, then deploy:
+
+```powershell
 # Live deployment: AKS + Defender + Helm sensor + disabled Sentinel rules + workbook
 ./scripts/Deploy-Lab.ps1 -Location "eastus" -ProjectName "aks-runtime-lab" -ApiServerAuthorizedIpRanges $operatorEgress
-
-# After reviewing the queries, explicitly enable the three rules.
-./scripts/Deploy-Lab.ps1 -Location "eastus" -ProjectName "aks-runtime-lab" -EnableSentinelRules
 ```
 
 The confirmation authorizes a live subscription-level change; it is not a
@@ -195,6 +233,13 @@ drift. See [Microsoft's authorized IP range guidance](https://learn.microsoft.co
 including connectivity propagation and egress requirements. The API endpoint
 remains public behind that IP allowlist, and this lab retains its existing local
 Kubernetes authentication. It is not a private or Entra-only cluster deployment.
+
+Review the queries, then enable the rules:
+
+```powershell
+# After reviewing the queries, explicitly enable the three rules.
+./scripts/Deploy-Lab.ps1 -Location "eastus" -ProjectName "aks-runtime-lab" -EnableSentinelRules
+```
 
 Run the test scenarios after the ownership-verified deployment:
 
@@ -266,6 +311,7 @@ before attributing an allow/deny result to a policy.
 |-- tests/
 |   |-- Test-AzJson.ps1                  # Offline Azure CLI output and error-handling checks
 |   |-- Test-DeployLabSafety.ps1         # Offline Azure/Kubernetes/Helm safety mocks
+|   |-- Test-ReadmeCommandBlocks.ps1     # Offline check of README copy-paste blocks
 |   `-- Test-RuntimeSafety.ps1           # Offline ownership mocks for the test helper
 |-- workbook/
 |   `-- container-runtime-workbook.json  # Container Runtime Security Dashboard
@@ -363,8 +409,15 @@ Destroy the lab when it is not in use.
 
 ## Cleanup
 
+Preview the cleanup:
+
 ```powershell
 ./scripts/Deploy-Lab.ps1 -ProjectName "aks-runtime-lab" -Destroy -WhatIf
+```
+
+Read the preview output, then run the cleanup:
+
+```powershell
 ./scripts/Deploy-Lab.ps1 -ProjectName "aks-runtime-lab" -Destroy
 ```
 
