@@ -38,3 +38,7 @@ jobs:
           ./tests/Test-DeployLabSafety.ps1
           ./tests/Test-RuntimeSafety.ps1
           ./tests/Test-AzJson.ps1
+
+      - name: Check README copy-paste blocks
+        shell: pwsh
+        run: ./tests/Test-ReadmeCommandBlocks.ps1
